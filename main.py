@@ -7,6 +7,10 @@ import pandas as pd
 import ccxt
 
 from flask import Flask
+@app.get("/test")
+def test():
+    send_telegram("✅ [투자봇] 텔레그램 연결 테스트")
+    return "sent", 200
 
 # ===================== 사용자/환경 설정 =====================
 SYMBOL       = os.getenv("SYMBOL", "BTC/USDT")   # 심볼
