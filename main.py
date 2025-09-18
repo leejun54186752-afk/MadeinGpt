@@ -1,5 +1,3 @@
-main.py
-# bot.py
 import os, time, math, json, requests
 from datetime import datetime, timezone
 import numpy as np
