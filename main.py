@@ -244,3 +244,8 @@ if __name__ == "__main__":
     print("Starting bot with built-in Flask (dev)...")
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+# (기존 Flask 라우트 바로 아래 아무 데나)
+@app.get("/test")
+def test():
+    send_telegram("✅ [투자봇] 텔레그램 연결 테스트 완료!")
+    return "sent", 200
