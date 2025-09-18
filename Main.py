@@ -224,3 +224,28 @@ if __name__ == "__main__":
     print("Starting bot...")
     send_telegram("🔔[투자봇] 시작했습니다. 알림 연결 OK")
     main_loop()
+    # 파일 상단에 추가
+from threading import Thread
+from flask import Flask
+import os
+
+# ... (기존 코드 그대로) ...
+
+app = Flask(__name__)
+
+@app.get("/")
+def health():
+    return "OK", 200
+
+def run_bot():
+    # 시작 테스트 메시지를 보내고 싶으면 주석 해제
+    # send_telegram("🔔[투자봇] Render(Web Service)에서 시작")
+    main_loop()
+
+if __name__ == "__main__":
+    print("Starting bot as Web Service...")
+    t = Thread(target=run_bot, daemon=True)
+    t.start()
+
+    port = int(os.getenv("PORT", "10000"))   # Render가 PORT를 주입해 줍니다
+    app.run(host="0.0.0.0", port=port)
