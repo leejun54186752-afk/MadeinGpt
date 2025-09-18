@@ -1,264 +1,256 @@
+# -*- coding: utf-8 -*-
+"""
+24/7 알림형 크립토 봇 (Render 무료 Web Service용)
+- 기본 거래소: Binance (Bybit 403 이슈 회피). 환경변수로 교체 가능.
+- 지표: EMA10/20 크로스, EMA200(추세필터), 거래량 평균필터,
+       선택: 간이 매물대(HVN 근접), ATR(알림 메시지용)
+- 텔레그램 푸시: 환경변수 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+- 웹서버(Flask)로 포트 바인딩 + 백그라운드 스레드에서 봇 실행
+"""
+
 import os, time, math, json, requests
 from datetime import datetime, timezone
+from threading import Thread
+
 import numpy as np
 import pandas as pd
 import ccxt
-from threading import Thread
+
 from flask import Flask
-import os  # (이미 있으면 중복 추가 X)
-# ====== 환경설정 ======
-SYMBOL   = 'BTC/USDT'   # Bybit 기준 심볼명 (ccxt 표기)
-TIMEFRAME= '15m'
-LIMIT    = 600          # 최근 봉 개수(매물대 계산용 여유 포함)
-POLL_SEC = 15           # 폴링 주기 (초). 15초 권장 (웹소켓 없이 가볍게)
 
-# 전략 파라미터
-EMA_SHORT = 10
-EMA_LONG  = 20
-EMA_TREND = 200
-USE_TREND = True
+# ===================== 사용자/환경 설정 =====================
+SYMBOL       = os.getenv("SYMBOL", "BTC/USDT")   # 심볼
+TIMEFRAME    = os.getenv("TIMEFRAME", "15m")     # 15분봉
+LIMIT        = int(os.getenv("LIMIT", "600"))    # 최근 캔들 개수(충분히 크게)
+POLL_SEC     = int(os.getenv("POLL_SEC", "15"))  # 폴링 주기(초)
 
-RSI_LEN   = 14
-RSI_LONG_MAX  = 35   # 롱 허용 RSI ≤
-RSI_SHORT_MIN = 65   # 숏 허용 RSI ≥
+EMA_SHORT    = int(os.getenv("EMA_SHORT", "10"))
+EMA_LONG     = int(os.getenv("EMA_LONG", "20"))
+EMA_TREND    = int(os.getenv("EMA_TREND", "200"))
+USE_TREND    = os.getenv("USE_TREND", "true").lower() == "true"
 
-VOL_MA_LEN   = 20
-NEED_VOL_BOOST = True  # 평균 이상 거래량만
+VOL_MA_LEN   = int(os.getenv("VOL_MA_LEN", "20"))
+NEED_VOL_BOOST = os.getenv("NEED_VOL_BOOST", "true").lower() == "true"
 
-ATR_LEN  = 14
-STOP_ATR = 2.0
-TAKE_ATR = 3.0
+ATR_LEN      = int(os.getenv("ATR_LEN", "14"))
 
-# 매물대(HVN) 근사
-VP_LOOKBACK_BARS = 300   # 최근 N봉 범위에서
-VP_BINS          = 40    # 가격 버킷 수
-HVN_COUNT        = 3     # 상위 매물대 개수
-HVN_TOL_ATR      = 0.5   # HVN 근접 허용(ATR x)
-REQUIRE_HVN_NEAR = True  # HVN 근접일 때만 신호 허용
+# 간이 HVN(매물대) 근접 사용 여부 및 파라미터
+REQUIRE_HVN_NEAR = os.getenv("REQUIRE_HVN_NEAR", "false").lower() == "true"
+HVN_BINS         = int(os.getenv("HVN_BINS", "60"))   # 가격구간 나누는 개수
+HVN_PEAK_TOPK    = int(os.getenv("HVN_PEAK_TOPK", "5"))  # 상위 매물대 개수
+HVN_TOL_ATR      = float(os.getenv("HVN_TOL_ATR", "0.8")) # 현재가가 매물대와 이 정도*ATR 이내면 근접
 
-# 쿨다운(분)
-COOLDOWN_MIN = 240
+# 알림 쿨다운
+COOLDOWN_MIN     = int(os.getenv("COOLDOWN_MIN", "60"))  # 같은 방향 재알림 최소 간격(분)
 
-# 알림/트레이딩
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '')
-ENABLE_TRADING     = False  # 자동매매 켜기: True (테스트넷/모의로 충분히 검증 후!)
+# 거래소 선택 (기본: binance)
+EXCHANGE_NAME    = os.getenv("EXCHANGE", "binance").lower().strip()
+# "bybit" 로 바꾸고 싶으면 EXCHANGE=bybit, 선물은 ex.options 설정을 추가하세요.
 
-# ====== 유틸 ======
-def ema(series, length):
-    return series.ewm(span=length, adjust=False).mean()
+# ===================== 텔레그램 =====================
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def rsi(series, length=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1*delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/length, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/length, adjust=False).mean()
-    rs = ma_up / (ma_down + 1e-12)
-    return 100 - (100 / (1 + rs))
-
-def atr(df, length=14):
-    high, low, close = df['high'], df['low'], df['close']
-    prev_close = close.shift(1)
-    tr = pd.concat([(high-low).abs(),
-                    (high-prev_close).abs(),
-                    (low-prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(length).mean()
-
-def volume_profile_hvn(prices, volumes, lookback=300, bins=40, topk=3):
-    # 최근 구간 자르기
-    prices = prices[-lookback:]
-    volumes = volumes[-lookback:]
-
-    pmin, pmax = prices.min(), prices.max()
-    if pmax <= pmin:
-        return []
-
-    hist, edges = np.histogram(prices, bins=bins, range=(pmin, pmax), weights=volumes)
-    # 상위 k개 인덱스
-    idxs = hist.argsort()[::-1][:topk]
-    # 버킷 중앙가격
-    centers = (edges[:-1] + edges[1:]) / 2.0
-    hvn_prices = centers[idxs]
-    hvn_prices = sorted(hvn_prices)
-    return hvn_prices
-
-def send_telegram(text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] 텔레그램 환경변수 없음. 메시지:", text)
+def send_telegram(msg: str):
+    if not TG_TOKEN or not TG_CHAT:
+        print("[WARN] Telegram env not set; msg skipped.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TG_CHAT,
+            "text": msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code >= 400:
+            print(f"[ERR] Telegram {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print("Telegram error:", e)
+        print("[ERR] Telegram error:", e)
 
-def now_kst():
-    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+# ===================== 거래소/데이터 =====================
+def build_exchange():
+    if EXCHANGE_NAME == "bybit":
+        ex = ccxt.bybit({"enableRateLimit": True})
+        # 필요시 선물(퍼프추얼) 기본 타입 설정
+        # ex.options = {'defaultType': 'swap'}
+    elif EXCHANGE_NAME in ("binanceusdm", "binance_futures", "binance_perp"):
+        ex = ccxt.binanceusdm({"enableRateLimit": True})
+    else:
+        ex = ccxt.binance({"enableRateLimit": True})
+    return ex
 
-# ====== 데이터 소스 (Bybit via ccxt) ======
-ex = ccxt.bybit({"enableRateLimit": True})
-# 선물 마켓을 명시하고 싶으면: ex.options = {'defaultType': 'future'}
+ex = build_exchange()
 
-def fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=LIMIT):
-    # ccxt 표준: [timestamp, open, high, low, close, volume]
-    o = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(o, columns=['ts','open','high','low','close','volume'])
-    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+def fetch_ohlcv(symbol, timeframe, limit):
+    """ccxt OHLCV -> pandas DataFrame"""
+    ohlcv = ex.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
+    cols = ["ts","open","high","low","close","volume"]
+    df = pd.DataFrame(ohlcv, columns=cols)
+    df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC")
     return df
 
-# ====== 전략 엔진 ======
-STATE_PATH = "state.json"
-def load_state():
-    if os.path.exists(STATE_PATH):
-        return json.load(open(STATE_PATH, "r"))
-    return {"last_long_ts": 0, "last_short_ts": 0}
+# ===================== 지표 계산 =====================
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
 
-def save_state(s):
-    json.dump(s, open(STATE_PATH, "w"))
+def atr(df: pd.DataFrame, length: int) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(length).mean()
 
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df["ema_s"] = ema(df["close"], EMA_SHORT)
+    df["ema_l"] = ema(df["close"], EMA_LONG)
+    df["ema_t"] = ema(df["close"], EMA_TREND)
+    df["vol_ma"] = df["volume"].rolling(VOL_MA_LEN).mean()
+    df["atr"] = atr(df, ATR_LEN)
+    return df
+
+# 간이 매물대(Volume by Close Price) 계산
+def volume_profile_hvn(df: pd.DataFrame, bins=60, topk=5):
+    closes = df["close"].values
+    vols   = df["volume"].values
+    if len(closes) < 5:
+        return []
+    lo, hi = closes.min(), closes.max()
+    if lo == hi:
+        return [lo]
+    hist_vol, edges = np.histogram(closes, bins=bins, range=(lo, hi), weights=vols)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    idx = np.argsort(hist_vol)[::-1][:topk]
+    peaks = centers[idx]
+    return sorted(peaks)
+
+def is_near_hvn(current_price: float, peaks: list, tol_atr: float, atr_value: float) -> bool:
+    if atr_value <= 0 or not peaks:
+        return False
+    tol = tol_atr * atr_value
+    return any(abs(current_price - p) <= tol for p in peaks)
+
+# ===================== 신호 로직 =====================
+_last_alert_ts_long  = 0.0
+_last_alert_ts_short = 0.0
+
+def cross_up(a: pd.Series, b: pd.Series) -> bool:
+    return a.iloc[-2] <= b.iloc[-2] and a.iloc[-1] > b.iloc[-1]
+
+def cross_down(a: pd.Series, b: pd.Series) -> bool:
+    return a.iloc[-2] >= b.iloc[-2] and a.iloc[-1] < b.iloc[-1]
+
+def build_message(side: str, last: pd.Series, atr_v: float, why: str):
+    dt = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    price = last["close"]
+    msg = [
+        f"🔔 <b>{SYMBOL}</b> {TIMEFRAME}  <b>{side}</b>",
+        f"가격: <b>{price:.2f}</b>",
+        f"EMA10/20: {last['ema_s']:.2f} / {last['ema_l']:.2f}",
+        f"EMA200: {last['ema_t']:.2f}",
+        f"거래량: {last['volume']:.3f} (평균 {last['vol_ma']:.3f})",
+        f"ATR({ATR_LEN}): {atr_v:.2f}",
+        f"이유: {why}",
+        f"<i>{dt}</i>"
+    ]
+    return "\n".join(msg)
+
+def check_signals(df: pd.DataFrame):
+    global _last_alert_ts_long, _last_alert_ts_short
+
+    last = df.iloc[-1]
+    atr_v = float(last["atr"]) if not math.isnan(last["atr"]) else 0.0
+
+    # 추세 필터
+    trend_ok_long  = (not USE_TREND) or (last["close"] > last["ema_t"])
+    trend_ok_short = (not USE_TREND) or (last["close"] < last["ema_t"])
+
+    # 거래량 필터
+    vol_ok = (not NEED_VOL_BOOST) or (last["volume"] >= last["vol_ma"])
+
+    # HVN 근접
+    hvn_ok = True
+    if REQUIRE_HVN_NEAR:
+        peaks = volume_profile_hvn(df, bins=HVN_BINS, topk=HVN_PEAK_TOPK)
+        hvn_ok = is_near_hvn(float(last["close"]), peaks, HVN_TOL_ATR, atr_v)
+
+    # 교차
+    long_cross  = cross_up(df["ema_s"], df["ema_l"])
+    short_cross = cross_down(df["ema_s"], df["ema_l"])
+
+    now = time.time()
+    cd_sec = COOLDOWN_MIN * 60
+
+    # 롱
+    if long_cross and trend_ok_long and vol_ok and hvn_ok:
+        if now - _last_alert_ts_long >= cd_sec:
+            _last_alert_ts_long = now
+            why = []
+            why.append("EMA10 ↑ EMA20")
+            if USE_TREND: why.append("가격 > EMA200")
+            if NEED_VOL_BOOST: why.append("거래량 ≥ 평균")
+            if REQUIRE_HVN_NEAR: why.append("HVN 근접")
+            send_telegram(build_message("LONG", last, atr_v, ", ".join(why)))
+
+    # 숏
+    if short_cross and trend_ok_short and vol_ok and hvn_ok:
+        if now - _last_alert_ts_short >= cd_sec:
+            _last_alert_ts_short = now
+            why = []
+            why.append("EMA10 ↓ EMA20")
+            if USE_TREND: why.append("가격 < EMA200")
+            if NEED_VOL_BOOST: why.append("거래량 ≥ 평균")
+            if REQUIRE_HVN_NEAR: why.append("HVN 근접")
+            send_telegram(build_message("SHORT", last, atr_v, ", ".join(why)))
+
+# ===================== 메인 루프 =====================
 def main_loop():
-    state = load_state()
-    cooldown_sec = COOLDOWN_MIN * 60
-
+    print(f"[bot] start: EXCHANGE={EXCHANGE_NAME}, SYMBOL={SYMBOL}, TF={TIMEFRAME}")
     while True:
         try:
-            df = fetch_ohlcv()
-            if len(df) < max(EMA_TREND, VP_LOOKBACK_BARS) + 5:
-                print("데이터 부족. 재시도.")
-                time.sleep(POLL_SEC); continue
-
-            # 지표
-            df['ema10'] = ema(df['close'], EMA_SHORT)
-            df['ema20'] = ema(df['close'], EMA_LONG)
-            df['ema200']= ema(df['close'], EMA_TREND)
-            df['rsi']   = rsi(df['close'], RSI_LEN)
-            df['atr']   = atr(df, ATR_LEN)
-            df['vol_ma']= df['volume'].rolling(VOL_MA_LEN).mean()
-
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            # 크로스 (종가 기준)
-            golden = (prev['ema10'] <= prev['ema20']) and (last['ema10'] > last['ema20'])
-            death  = (prev['ema10'] >= prev['ema20']) and (last['ema10'] < last['ema20'])
-
-            trend_long_ok  = (not USE_TREND) or (last['close'] > last['ema200'])
-            trend_short_ok = (not USE_TREND) or (last['close'] < last['ema200'])
-            vol_ok = (not NEED_VOL_BOOST) or (last['volume'] >= last['vol_ma'])
-
-            long_base  = golden and (last['rsi'] <= RSI_LONG_MAX)  and vol_ok and trend_long_ok
-            short_base = death  and (last['rsi'] >= RSI_SHORT_MIN) and vol_ok and trend_short_ok
-
-            # HVN 계산 (근사)
-            hvns = volume_profile_hvn(df['close'].values, df['volume'].values,
-                                      lookback=VP_LOOKBACK_BARS, bins=VP_BINS, topk=HVN_COUNT)
-            near_hvn = False
-            if len(hvns) > 0 and not math.isnan(last['atr']):
-                for p in hvns:
-                    if abs(last['close'] - p) <= HVN_TOL_ATR * last['atr']:
-                        near_hvn = True
-                        break
-
-            long_ok  = long_base  and (near_hvn if REQUIRE_HVN_NEAR else True)
-            short_ok = short_base and (near_hvn if REQUIRE_HVN_NEAR else True)
-
-            # 쿨다운 체크 (바가 확정된 직후만 보도록 ts 사용)
-            ts = int(df['ts'].iloc[-1].timestamp())
-            text_common = (f"[{now_kst()}]\n"
-                           f"{SYMBOL} {TIMEFRAME}\n"
-                           f"가격: {last['close']:.2f}\n"
-                           f"EMA10/20: {last['ema10']:.2f}/{last['ema20']:.2f}\n"
-                           f"RSI: {last['rsi']:.2f} | ATR: {last['atr']:.2f}\n"
-                           f"HVN: {', '.join([f'{p:.2f}' for p in sorted(hvns)])}\n")
-
-            # 롱 신호
-            if long_ok and (ts - state["last_long_ts"] >= cooldown_sec):
-                stop = last['close'] - STOP_ATR * last['atr']
-                take = last['close'] + TAKE_ATR * last['atr']
-                msg = (text_common +
-                      f"신호: LONG (합의 + HVN근접)\n"
-                       "권장: 분할·손절고정\n"
-                      f"손절/익절: {stop:.2f} / {take:.2f}\n"
-                       "(연구용, 투자권유 아님)")
-                send_telegram(msg)
-                state["last_long_ts"] = ts
-                save_state(state)
-
-                if ENABLE_TRADING:
-                    place_order(side='buy', price=float(last['close']),
-                                stop=float(stop), take=float(take))
-
-            # 숏 신호
-            if short_ok and (ts - state["last_short_ts"] >= cooldown_sec):
-                stop = last['close'] + STOP_ATR * last['atr']
-                take = last['close'] - TAKE_ATR * last['atr']
-                msg = (text_common +
-                      f"신호: SHORT (합의 + HVN근접)\n"
-                       "권장: 분할·손절고정\n"
-                      f"손절/익절: {stop:.2f} / {take:.2f}\n"
-                       "(연구용, 투자권유 아님)")
-                send_telegram(msg)
-                state["last_short_ts"] = ts
-                save_state(state)
-
+            df = fetch_ohlcv(SYMBOL, TIMEFRAME, LIMIT)
+            df = add_indicators(df).dropna()
+            if len(df) >= max(EMA_TREND, VOL_MA_LEN, ATR_LEN) + 5:
+                check_signals(df)
+        except ccxt.BaseError as e:
+            print("[ccxt] error:", e)
         except Exception as e:
-            print("loop error:", e)
-
+            print("[loop] error:", e)
         time.sleep(POLL_SEC)
 
-# ====== (옵션) 자동매매 스텁 ======
-def place_order(side, price, stop, take):
-    """
-    TODO: Bybit 주문 로직.
-    - 권장: Bybit 공식 라이브러리(pybit) 또는 ccxt의 create_order 사용
-    - 필수: 격리모드/레버리지 설정, idempotency 키, 일일 손실 한도, 중복 주문 방지
-    """
-    print(f"[DRY RUN] {side.upper()} @ {price} | SL {stop} | TP {take}")
-    # 예시 (나중에 활성화):
-    # order = ex.create_order(symbol=SYMBOL, type='market', side='buy', amount=qty)
-    # ex.create_order(symbol=SYMBOL, type='stop_market', side='sell', amount=qty,
-    #                 params={'stopLossPrice': stop, 'takeProfitPrice': take})
-
-if __name__ == "__main__":
-    print("Starting bot...")
-    send_telegram("🔔[투자봇] 시작했습니다. 알림 연결 OK")
-    main_loop()
-    # 파일 상단에 추가
-from threading import Thread
-from flask import Flask
-import os
-
-# ... (기존 코드 그대로) ...
-
+# ===================== Flask(Web Service) & 구니콘 진입 =====================
 app = Flask(__name__)
 
 @app.get("/")
 def health():
-    return "OK", 200
+    # 간단 상태 표시
+    body = {
+        "status": "ok",
+        "symbol": SYMBOL,
+        "timeframe": TIMEFRAME,
+        "exchange": EXCHANGE_NAME,
+        "utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return (json.dumps(body), 200, {"Content-Type": "application/json"})
 
-def run_bot():
-    # 시작 테스트 메시지를 보내고 싶으면 주석 해제
-    # send_telegram("🔔[투자봇] Render(Web Service)에서 시작")
-    main_loop()
+# gunicorn에서 import 시 바로 백그라운드 워커를 1회만 시작
+_worker_started = False
+def _start_worker_once():
+    global _worker_started
+    if not _worker_started:
+        _worker_started = True
+        Thread(target=main_loop, daemon=True).start()
+        # 시작 알림이 필요하면 아래 주석 해제
+        # send_telegram("🔔[투자봇] Render(Web Service)에서 시작")
 
-# ---- Flask healthcheck + 백그라운드 실행 ----
-app = Flask(__name__)
+_start_worker_once()
 
-@app.get("/")
-def health():
-    return "OK", 200
-
-def run_bot():
-    # 시작 알림이 필요하면 주석 해제
-    # send_telegram("🔔[투자봇] Render(Web Service)에서 시작")
-    main_loop()
-
+# 로컬에서 직접 실행할 때만(개발용)
 if __name__ == "__main__":
-    print("Starting bot as Web Service...")
-    t = Thread(target=run_bot, daemon=True)
-    t.start()
-
-    # Render가 PORT 환경변수를 넣어줍니다.
+    print("Starting bot with built-in Flask (dev)...")
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
