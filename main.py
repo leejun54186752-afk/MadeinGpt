@@ -3,7 +3,9 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import ccxt
-
+from threading import Thread
+from flask import Flask
+import os  # (이미 있으면 중복 추가 X)
 # ====== 환경설정 ======
 SYMBOL   = 'BTC/USDT'   # Bybit 기준 심볼명 (ccxt 표기)
 TIMEFRAME= '15m'
@@ -240,11 +242,23 @@ def run_bot():
     # send_telegram("🔔[투자봇] Render(Web Service)에서 시작")
     main_loop()
 
+# ---- Flask healthcheck + 백그라운드 실행 ----
+app = Flask(__name__)
+
+@app.get("/")
+def health():
+    return "OK", 200
+
+def run_bot():
+    # 시작 알림이 필요하면 주석 해제
+    # send_telegram("🔔[투자봇] Render(Web Service)에서 시작")
+    main_loop()
+
 if __name__ == "__main__":
     print("Starting bot as Web Service...")
     t = Thread(target=run_bot, daemon=True)
     t.start()
 
-    port = int(os.getenv("PORT", "10000"))   # Render가 PORT를 주입해 줍니다
+    # Render가 PORT 환경변수를 넣어줍니다.
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-    
