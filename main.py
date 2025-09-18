@@ -1,13 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-24/7 알림형 크립토 봇 (Render 무료 Web Service용)
-- 기본 거래소: Binance (Bybit 403 이슈 회피). 환경변수로 교체 가능.
-- 지표: EMA10/20 크로스, EMA200(추세필터), 거래량 평균필터,
-       선택: 간이 매물대(HVN 근접), ATR(알림 메시지용)
-- 텔레그램 푸시: 환경변수 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
-- 웹서버(Flask)로 포트 바인딩 + 백그라운드 스레드에서 봇 실행
-"""
-
 import os, time, math, json, requests
 from datetime import datetime, timezone
 from threading import Thread
@@ -48,8 +38,8 @@ EXCHANGE_NAME    = os.getenv("EXCHANGE", "binance").lower().strip()
 # "bybit" 로 바꾸고 싶으면 EXCHANGE=bybit, 선물은 ex.options 설정을 추가하세요.
 
 # ===================== 텔레그램 =====================
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7898891479:AAEOdkJEupPj9k_t4YlhqvYJd7Jbsot_5ao")
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "8095272059")
 
 def send_telegram(msg: str):
     if not TG_TOKEN or not TG_CHAT:
