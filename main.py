@@ -7,10 +7,36 @@ import pandas as pd
 import ccxt
 
 from flask import Flask
+from flask import Flask
+from threading import Thread
+import os
+
+app = Flask(__name__)   # ← 1) 가장 먼저 app을 만든 뒤
+
+@app.get("/")           # ← 2) 라우트들을 이어서 선언
+def health():
+    return "OK", 200
+
 @app.get("/test")
 def test():
     send_telegram("✅ [투자봇] 텔레그램 연결 테스트")
     return "sent", 200
+
+# --- 아래는 봇 스레드 시작부 (한 번만 실행) ---
+_worker_started = False
+def _start_worker_once():
+    global _worker_started
+    if not _worker_started:
+        _worker_started = True
+        Thread(target=main_loop, daemon=True).start()
+        # send_telegram("🔔[투자봇] Render(Web Service)에서 시작")  # 원하면 주석 해제
+
+_start_worker_once()  # gunicorn import 시 바로 실행
+
+# 로컬로 파이썬 직접 실행할 때만 쓰이는 부분
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
 
 # ===================== 사용자/환경 설정 =====================
 SYMBOL       = os.getenv("SYMBOL", "BTC/USDT")   # 심볼
