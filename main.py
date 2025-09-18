@@ -1,10 +1,11 @@
-import os, time, math, json, requests
+import os, time, math, json, random, requests
 from datetime import datetime, timezone
 from threading import Thread
 
 import numpy as np
 import pandas as pd
 import ccxt
+from flask import Flask
 
 # ===================== 환경 변수 =====================
 SYMBOLS_STR   = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT")
@@ -12,7 +13,7 @@ SYMBOLS       = [s.strip() for s in SYMBOLS_STR.split(",") if s.strip()]
 EXCHANGE_NAME = os.getenv("EXCHANGE", "binance").lower().strip()  # binance | binanceusdm | bybit
 TIMEFRAME     = os.getenv("TIMEFRAME", "15m")
 LIMIT         = int(os.getenv("LIMIT", "600"))
-POLL_SEC      = int(os.getenv("POLL_SEC", "15"))  # 루프 대기
+POLL_SEC      = int(os.getenv("POLL_SEC", "15"))  # 메인루프 대기(초)
 
 # 지표 파라미터
 EMA_FAST  = int(os.getenv("EMA_FAST", "20"))   # 리테스트 대상
@@ -33,6 +34,12 @@ COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "60"))
 # 텔레그램
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# 호출 간격/백오프 (레이트리밋 보호)
+FETCH_MIN_SEC = int(os.getenv("FETCH_MIN_SEC", "55"))  # 심볼당 최소 재호출 간격(초)
+BACKOFF_START = int(os.getenv("BACKOFF_START", "60"))  # 429/418 시작 백오프(초)
+BACKOFF_MAX   = int(os.getenv("BACKOFF_MAX", "600"))   # 최대 백오프(초) 10분
+JITTER_MAX    = int(os.getenv("JITTER_MAX", "3"))      # 심볼 사이 호출 지터(초)
 
 # ===================== 유틸/알림 =====================
 def send_telegram(msg: str):
@@ -66,17 +73,61 @@ def build_exchange():
 
 ex = build_exchange()
 
-def fetch_ohlcv(symbol, timeframe, limit):
-    ohlcv = ex.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-    df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC")
-    return df
+# fetch 쓰로틀/백오프 캐시
+_last_fetch = {}    # symbol -> epoch
+_df_cache   = {}    # symbol -> 최신 df
+_backoff    = 0     # 전역 백오프(초), 429/418 발생 시 증가
+
+def fetch_ohlcv_throttled(symbol, timeframe, limit):
+    """레이트리밋 친화적 안전 래퍼"""
+    global _last_fetch, _df_cache, _backoff
+    now = time.time()
+    last_t = _last_fetch.get(symbol, 0)
+
+    # 최소 호출 간격 유지 + 캐시 리턴
+    if now - last_t < FETCH_MIN_SEC and symbol in _df_cache:
+        return _df_cache[symbol]
+
+    # 심볼별 호출 지터(동시폭주 방지)
+    if JITTER_MAX > 0:
+        time.sleep(random.uniform(0, JITTER_MAX))
+
+    # 백오프 대기
+    if _backoff > 0:
+        time.sleep(_backoff)
+
+    try:
+        ohlcv = ex.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC")
+
+        _df_cache[symbol]  = df
+        _last_fetch[symbol] = time.time()
+        # 성공 시 백오프 완화(절반)
+        _backoff = max(0, int(_backoff / 2))
+        return df
+
+    except ccxt.BaseError as e:
+        msg = str(e)
+        # 레이트리밋/밴 감지 → 지수 백오프
+        if ("429" in msg) or ("418" in msg) or ("Too much request" in msg) or ("Way too much" in msg):
+            _backoff = BACKOFF_START if _backoff == 0 else min(BACKOFF_MAX, _backoff * 2)
+            print(f"[rate-limit] backoff={_backoff}s; symbol={symbol}; err={msg[:160]}")
+        else:
+            print(f"[ccxt:{symbol}] error:", msg[:200])
+        # 캐시가 있으면 임시로 캐시 반환(완전 중단 방지)
+        if symbol in _df_cache:
+            return _df_cache[symbol]
+        # 캐시도 없으면 빈 DF
+        return pd.DataFrame(columns=["ts","open","high","low","close","volume","dt"])
 
 # ===================== 지표 =====================
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
 def atr(df: pd.DataFrame, length: int) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype="float64")
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
     tr = pd.concat([
@@ -87,9 +138,11 @@ def atr(df: pd.DataFrame, length: int) -> pd.Series:
     return tr.rolling(length).mean()
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df["ema_fast"] = ema(df["close"], EMA_FAST)
+    if df.empty:
+        return df
+    df["ema_fast"]  = ema(df["close"], EMA_FAST)
     df["ema_trend"] = ema(df["close"], EMA_TREND)
-    df["atr"] = atr(df, ATR_LEN)
+    df["atr"]       = atr(df, ATR_LEN)
     return df
 
 # ===================== 상태/로직 =====================
@@ -127,15 +180,20 @@ def compute_levels(side: str, entry: float, atr_v: float):
         tp = entry - RR * risk
         sl_diff = sl - entry
         tp_diff = entry - tp
-    sl_pct = (sl_diff / entry) * 100.0
-    tp_pct = (tp_diff / entry) * 100.0
+    sl_pct = (sl_diff / entry) * 100.0 if entry else 0.0
+    tp_pct = (tp_diff / entry) * 100.0 if entry else 0.0
     return round(sl, 2), round(tp, 2), round(sl_diff, 2), round(tp_diff, 2), sl_pct, tp_pct
 
 def build_message(sym: str, side: str, entry: float, sl: float, tp: float,
                   sl_diff: float, tp_diff: float, sl_pct: float, tp_pct: float,
                   last: pd.Series, rc_info: dict):
     dt = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    tol_ratio = abs(last["close"] - last["ema_fast"]) / max(last["atr"], 1e-9) if not math.isnan(last["atr"]) else float("nan")
+    atr_v = float(last.get("atr", float("nan")))
+    ema_f = float(last.get("ema_fast", float("nan")))
+    ema_t = float(last.get("ema_trend", float("nan")))
+    price = float(last.get("close", float("nan")))
+    # EMA근접 정도(ATR배수)
+    tol_ratio = abs(price - ema_f) / atr_v if (atr_v and not math.isnan(atr_v)) else float("nan")
 
     lines = [
         f"🔔 <b>{sym}</b> {TIMEFRAME} <b>{side}</b> (확인형 EMA{EMA_FAST} 리테스트 확정)",
@@ -144,13 +202,13 @@ def build_message(sym: str, side: str, entry: float, sl: float, tp: float,
         f"TP: {fmt_price(tp)} USDT  (+{fmt_price(tp_diff)}, +{fmt_pct(tp_pct)})",
         "",
         f"조건: EMA{EMA_TREND} {'상단' if side=='LONG' else '하단'}, EMA{EMA_FAST} 근접(≈ {tol_ratio:.2f}×ATR) 후 다음봉 {'고가' if side=='LONG' else '저가'} 돌파 마감",
-        f"현재가: {fmt_price(last['close'])}, EMA{EMA_FAST}: {fmt_price(last['ema_fast'])}, EMA{EMA_TREND}: {fmt_price(last['ema_trend'])}, ATR{ATR_LEN}: {fmt_price(last['atr'])}",
+        f"현재가: {fmt_price(price)}, EMA{EMA_FAST}: {fmt_price(ema_f)}, EMA{EMA_TREND}: {fmt_price(ema_t)}, ATR{ATR_LEN}: {fmt_price(atr_v)}",
         f"리테스트 봉 (UTC): H={fmt_price(rc_info['high'])}, L={fmt_price(rc_info['low'])}, C={fmt_price(rc_info['close'])}",
         f"<i>{dt}</i>",
     ]
     return "\n".join(lines)
 
-def maybe_alert(sym: str, side: str, entry: float, df: pd.DataFrame, last: pd.Series, rc_info: dict):
+def maybe_alert(sym: str, side: str, entry: float, last: pd.Series, rc_info: dict):
     # 쿨다운 체크
     key = (sym, side)
     now = time.time()
@@ -159,20 +217,21 @@ def maybe_alert(sym: str, side: str, entry: float, df: pd.DataFrame, last: pd.Se
     if now - _last_alert_ts[key] < COOLDOWN_MIN * 60:
         return
 
-    atr_v = float(last["atr"]) if not math.isnan(last["atr"]) else 0.0
+    atr_v = float(last.get("atr", 0.0))
     sl, tp, sl_diff, tp_diff, sl_pct, tp_pct = compute_levels(side, entry, atr_v)
     msg = build_message(sym, side, entry, sl, tp, sl_diff, tp_diff, sl_pct, tp_pct, last, rc_info)
     send_telegram(msg)
     _last_alert_ts[key] = now
 
 def process_symbol(sym: str):
-    df = fetch_ohlcv(sym, TIMEFRAME, LIMIT)
+    df = fetch_ohlcv_throttled(sym, TIMEFRAME, LIMIT)
+    if df.empty:
+        return
     df = add_indicators(df).dropna()
     if len(df) < max(EMA_TREND, ATR_LEN) + 5:
         return
 
     last = df.iloc[-1]
-    prev = df.iloc[-2]
 
     # 1) 추세판단
     trend_now = "up" if last["close"] > last["ema_trend"] else "down"
@@ -180,12 +239,10 @@ def process_symbol(sym: str):
 
     st = state[sym]
 
-    # 추세 바뀌면 대기 초기화는 ensure_state에서 처리됨.
     # 2) 리테스트 감지 (대기 중 & 윈도우 남아있을 때 & 아직 확인대기 아님)
     if not st["waiting_confirm"] and st["window_left"] > 0:
-        # EMA20 근접: |Close - EMA20| <= RETEST_TOL_ATR * ATR
-        near = False
         atr_v = float(last["atr"]) if not math.isnan(last["atr"]) else 0.0
+        near = False
         if atr_v > 0:
             near = abs(float(last["close"]) - float(last["ema_fast"])) <= (RETEST_TOL_ATR * atr_v)
 
@@ -204,6 +261,7 @@ def process_symbol(sym: str):
     # 3) 확인(다음 봉에서 돌파 마감) & 알림
     if st["waiting_confirm"] and st["retest_candle"] is not None:
         rc = st["retest_candle"]
+
         # 추세 무효화 체크: 확인 전에 추세 깨지면 리셋
         if trend_now == "up" and last["close"] < last["ema_trend"]:
             reset_state_for(sym, "down")
@@ -217,14 +275,14 @@ def process_symbol(sym: str):
             confirmed = float(last["close"]) >= rc["high"]
             if confirmed:
                 entry = float(last["close"])  # 확인봉 종가
-                maybe_alert(sym, "LONG", entry, df, last, rc)
+                maybe_alert(sym, "LONG", entry, last, rc)
                 reset_state_for(sym, "up")
                 return
         else:
             confirmed = float(last["close"]) <= rc["low"]
             if confirmed:
                 entry = float(last["close"])
-                maybe_alert(sym, "SHORT", entry, df, last, rc)
+                maybe_alert(sym, "SHORT", entry, last, rc)
                 reset_state_for(sym, "down")
                 return
 
@@ -234,7 +292,7 @@ def main_loop():
     # 초기 상태 세팅
     for sym in SYMBOLS:
         try:
-            df0 = fetch_ohlcv(sym, TIMEFRAME, limit= max(EMA_TREND, ATR_LEN) + 5)
+            df0 = fetch_ohlcv_throttled(sym, TIMEFRAME, limit=max(EMA_TREND, ATR_LEN) + 5)
             df0 = add_indicators(df0).dropna()
             if len(df0) == 0:
                 trend0 = "up"
@@ -242,7 +300,7 @@ def main_loop():
                 trend0 = "up" if df0.iloc[-1]["close"] > df0.iloc[-1]["ema_trend"] else "down"
             reset_state_for(sym, trend0)
         except Exception as e:
-            print(f"[init:{sym}] error:", e)
+            print(f"[init:{sym}] error:", str(e)[:200])
             reset_state_for(sym, "up")
 
     while True:
@@ -252,15 +310,14 @@ def main_loop():
                     process_symbol(sym)
                     time.sleep(0.4)
                 except ccxt.BaseError as e:
-                    print(f"[ccxt:{sym}] error:", e)
+                    print(f"[ccxt:{sym}] error:", str(e)[:200])
                 except Exception as e:
-                    print(f"[loop:{sym}] error:", e)
+                    print(f"[loop:{sym}] error:", str(e)[:200])
         except Exception as e:
-            print("[loop] outer error:", e)
+            print("[loop] outer error:", str(e)[:200])
         time.sleep(POLL_SEC)
 
-# ===================== Flask (파일 맨 아래 - 방법 A) =====================
-from flask import Flask
+# ===================== Flask =====================
 app = Flask(__name__)
 
 @app.get("/")
@@ -280,6 +337,11 @@ def health():
             "ATR_SL_MULT": ATR_SL_MULT,
             "RR": RR,
             "COOLDOWN_MIN": COOLDOWN_MIN,
+            "FETCH_MIN_SEC": FETCH_MIN_SEC,
+            "BACKOFF_START": BACKOFF_START,
+            "BACKOFF_MAX": BACKOFF_MAX,
+            "JITTER_MAX": JITTER_MAX,
+            "POLL_SEC": POLL_SEC,
         }
     }
     return (json.dumps(body), 200, {"Content-Type": "application/json"})
@@ -296,8 +358,6 @@ def _start_worker_once():
     if not _worker_started:
         _worker_started = True
         Thread(target=main_loop, daemon=True).start()
-        # 원하면 시작 알림:
-        # send_telegram("🔔[투자봇] Render(Web Service)에서 시작")
 
 _start_worker_once()
 
