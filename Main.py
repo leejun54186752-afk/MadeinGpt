@@ -249,3 +249,4 @@ if __name__ == "__main__":
 
     port = int(os.getenv("PORT", "10000"))   # Render가 PORT를 주입해 줍니다
     app.run(host="0.0.0.0", port=port)
+    
