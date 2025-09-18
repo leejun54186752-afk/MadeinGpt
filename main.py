@@ -8,38 +8,45 @@ import ccxt
 from flask import Flask
 
 # ===================== 환경 변수 =====================
-SYMBOLS_STR   = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT")
-SYMBOLS       = [s.strip() for s in SYMBOLS_STR.split(",") if s.strip()]
-EXCHANGE_NAME = os.getenv("EXCHANGE", "binance").lower().strip()  # binance | binanceusdm | bybit
-TIMEFRAME     = os.getenv("TIMEFRAME", "15m")
-LIMIT         = int(os.getenv("LIMIT", "600"))
-POLL_SEC      = int(os.getenv("POLL_SEC", "15"))  # 메인루프 대기(초)
+if not os.getenv("RENDER"):
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=False)
+    except Exception:
+        pass
+
+EXCHANGE = os.getenv("EXCHANGE", "bybit").strip().lower()
+SYMBOLS  = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",")
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+POLL_SEC  = int(os.getenv("POLL_SEC", "15"))
 
 # 지표 파라미터
-EMA_FAST  = int(os.getenv("EMA_FAST", "20"))   # 리테스트 대상
-EMA_TREND = int(os.getenv("EMA_TREND", "200")) # 추세 필터
+EMA_FAST  = int(os.getenv("EMA_FAST", "20"))
+EMA_TREND = int(os.getenv("EMA_TREND", "200"))
+EMA_SHORT = int(os.getenv("EMA_SHORT", "50"))   # 골든크로스 단기
+EMA_LONG  = int(os.getenv("EMA_LONG", "200"))   # 골든크로스 장기
 ATR_LEN   = int(os.getenv("ATR_LEN", "14"))
 
 # 리테스트 규칙
-RETEST_TOL_ATR = float(os.getenv("RETEST_TOL_ATR", "0.3"))  # |Close-EMA20| <= 0.3*ATR
-RETEST_WINDOW  = int(os.getenv("RETEST_WINDOW", "30"))      # 추세 확립 후 대기 캔들 수
+RETEST_TOL_ATR = float(os.getenv("RETEST_TOL_ATR", "0.3"))
+RETEST_WINDOW  = int(os.getenv("RETEST_WINDOW", "30"))
 
 # SL/TP (A안: ATR 기반)
-ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.5"))  # SL = entry ± 1.5*ATR
-RR          = float(os.getenv("RR", "2.0"))           # TP = entry ± RR*(SL폭)
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.5"))
+RR          = float(os.getenv("RR", "2.0"))
 
-# 쿨다운(동일 심볼 동일 방향 재알림 최소 간격 / 분)
+# 쿨다운
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "60"))
 
 # 텔레그램
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# 호출 간격/백오프 (레이트리밋 보호)
-FETCH_MIN_SEC = int(os.getenv("FETCH_MIN_SEC", "55"))  # 심볼당 최소 재호출 간격(초)
-BACKOFF_START = int(os.getenv("BACKOFF_START", "60"))  # 429/418 시작 백오프(초)
-BACKOFF_MAX   = int(os.getenv("BACKOFF_MAX", "600"))   # 최대 백오프(초) 10분
-JITTER_MAX    = int(os.getenv("JITTER_MAX", "3"))      # 심볼 사이 호출 지터(초)
+# 호출 간격/백오프
+FETCH_MIN_SEC = int(os.getenv("FETCH_MIN_SEC", "55"))
+BACKOFF_START = int(os.getenv("BACKOFF_START", "60"))
+BACKOFF_MAX   = int(os.getenv("BACKOFF_MAX", "600"))
+JITTER_MAX    = int(os.getenv("JITTER_MAX", "3"))
 
 # ===================== 유틸/알림 =====================
 def send_telegram(msg: str):
@@ -59,66 +66,46 @@ def fmt_price(x: float) -> str:
     return f"{x:,.2f}"
 
 def fmt_pct(p: float) -> str:
-    # 소수 둘째 자리까지
     return f"{p:.2f}%"
 
 # ===================== 거래소/데이터 =====================
 def build_exchange():
-    if EXCHANGE_NAME == "bybit":
+    if EXCHANGE == "bybit":
         return ccxt.bybit({"enableRateLimit": True})
-    elif EXCHANGE_NAME in ("binanceusdm", "binance_futures", "binance_perp"):
-        return ccxt.binanceusdm({"enableRateLimit": True})
     else:
-        return ccxt.binance({"enableRateLimit": True})
+        return ccxt.binanceusdm({"enableRateLimit": True})
 
 ex = build_exchange()
 
-# fetch 쓰로틀/백오프 캐시
-_last_fetch = {}    # symbol -> epoch
-_df_cache   = {}    # symbol -> 최신 df
-_backoff    = 0     # 전역 백오프(초), 429/418 발생 시 증가
+_last_fetch = {}
+_df_cache   = {}
+_backoff    = 0
 
-def fetch_ohlcv_throttled(symbol, timeframe, limit):
-    """레이트리밋 친화적 안전 래퍼"""
+def fetch_ohlcv_throttled(symbol, timeframe, limit=500):
     global _last_fetch, _df_cache, _backoff
     now = time.time()
     last_t = _last_fetch.get(symbol, 0)
-
-    # 최소 호출 간격 유지 + 캐시 리턴
     if now - last_t < FETCH_MIN_SEC and symbol in _df_cache:
         return _df_cache[symbol]
-
-    # 심볼별 호출 지터(동시폭주 방지)
     if JITTER_MAX > 0:
         time.sleep(random.uniform(0, JITTER_MAX))
-
-    # 백오프 대기
     if _backoff > 0:
         time.sleep(_backoff)
-
     try:
         ohlcv = ex.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC")
-
+        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         _df_cache[symbol]  = df
-        _last_fetch[symbol] = time.time()
-        # 성공 시 백오프 완화(절반)
+        _last_fetch[symbol] = now
         _backoff = max(0, int(_backoff / 2))
         return df
-
     except ccxt.BaseError as e:
         msg = str(e)
-        # 레이트리밋/밴 감지 → 지수 백오프
-        if ("429" in msg) or ("418" in msg) or ("Too much request" in msg) or ("Way too much" in msg):
+        if ("429" in msg) or ("418" in msg):
             _backoff = BACKOFF_START if _backoff == 0 else min(BACKOFF_MAX, _backoff * 2)
-            print(f"[rate-limit] backoff={_backoff}s; symbol={symbol}; err={msg[:160]}")
-        else:
-            print(f"[ccxt:{symbol}] error:", msg[:200])
-        # 캐시가 있으면 임시로 캐시 반환(완전 중단 방지)
+            print(f"[rate-limit] backoff={_backoff}s; {symbol}; {msg[:100]}")
         if symbol in _df_cache:
             return _df_cache[symbol]
-        # 캐시도 없으면 빈 DF
         return pd.DataFrame(columns=["ts","open","high","low","close","volume","dt"])
 
 # ===================== 지표 =====================
@@ -126,8 +113,7 @@ def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
 def atr(df: pd.DataFrame, length: int) -> pd.Series:
-    if df.empty:
-        return pd.Series(dtype="float64")
+    if df.empty: return pd.Series(dtype="float64")
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
     tr = pd.concat([
@@ -138,230 +124,221 @@ def atr(df: pd.DataFrame, length: int) -> pd.Series:
     return tr.rolling(length).mean()
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+    if df.empty: return df
     df["ema_fast"]  = ema(df["close"], EMA_FAST)
     df["ema_trend"] = ema(df["close"], EMA_TREND)
+    df["ema_short"] = ema(df["close"], EMA_SHORT)
+    df["ema_long"]  = ema(df["close"], EMA_LONG)
     df["atr"]       = atr(df, ATR_LEN)
     return df
 
-# ===================== 상태/로직 =====================
-# 심볼별 상태 (간단 dict)
-state = {}
-# 최근 알림 시간 (쿨다운)
-_last_alert_ts = {}  # key: (symbol, side)
+# ===================== Barrier 계산 (Pivot + PrevHL + HTF + HVN) =====================
+def find_pivot_levels(df, left=3, right=3, lookback=300):
+    highs, lows = [], []
+    n = len(df)
+    start = max(0, n - lookback)
+    for i in range(start + left, n - right):
+        hh, ll = df["high"].iloc[i], df["low"].iloc[i]
+        if all(hh > df["high"].iloc[i-k-1] for k in range(left)) and \
+           all(hh >= df["high"].iloc[i+k+1] for k in range(right)):
+            highs.append(float(hh))
+        if all(ll < df["low"].iloc[i-k-1] for k in range(left)) and \
+           all(ll <= df["low"].iloc[i+k+1] for k in range(right)):
+            lows.append(float(ll))
+    return sorted(set(highs)), sorted(set(lows))
 
-def reset_state_for(symbol: str, trend: str):
-    # trend: "up" or "down"
-    state[symbol] = {
-        "trend": trend,
-        "window_left": RETEST_WINDOW,
-        "waiting_confirm": False,
-        "retest_candle": None,  # dict: {high, low, close, ts}
-    }
+def prev_day_hl(df):
+    if df.empty: return None, None
+    ddf = df.set_index(df["dt"]).resample("1D").agg({"high":"max","low":"min"})
+    if len(ddf) < 2: return None, None
+    prev = ddf.iloc[-2]
+    return float(prev["high"]), float(prev["low"])
 
-def ensure_state(symbol: str, trend_now: str):
-    if symbol not in state:
-        reset_state_for(symbol, trend_now)
+def htf_levels(symbol, ema_len=200, don_len=55, tf="1h"):
+    try:
+        df_htf = fetch_ohlcv_throttled(symbol, tf, limit=max(ema_len, don_len)+5)
+        df_htf = add_indicators(df_htf).dropna()
+        if df_htf.empty: return None, None, None
+        ema200_val = float(df_htf["ema_trend"].iloc[-1])
+        high_dc = float(df_htf["high"].rolling(don_len).max().iloc[-1])
+        low_dc  = float(df_htf["low"].rolling(don_len).min().iloc[-1])
+        return ema200_val, high_dc, low_dc
+    except: return None, None, None
+
+def approx_hvn_poc(df, bins=60, lookback=400):
+    if df.empty: return [], None
+    seg = df.iloc[-lookback:].copy()
+    lo, hi = float(seg["low"].min()), float(seg["high"].max())
+    if hi <= lo: return [], None
+    edges = np.linspace(lo, hi, bins+1)
+    hist  = np.zeros(bins)
+    for _, row in seg.iterrows():
+        h, l, v = row["high"], row["low"], row["volume"]
+        if h <= l or v <= 0: continue
+        a, b = int((l-lo)/(hi-lo)*bins), int((h-lo)/(hi-lo)*bins)
+        a, b = max(0,a), min(bins-1,b)
+        hist[a:b+1] += v / max(1,b-a+1)
+    poc_idx = int(hist.argmax())
+    poc_price = float((edges[poc_idx]+edges[poc_idx+1])/2)
+    thr = np.percentile(hist[hist>0],85) if hist.sum()>0 else 0
+    peaks=[]
+    for i in range(1,bins-1):
+        if hist[i]>=hist[i-1] and hist[i]>=hist[i+1] and hist[i]>=thr:
+            peaks.append(float((edges[i]+edges[i+1])/2))
+    return sorted(set(peaks)), poc_price
+
+def pick_barrier(side, entry, df, symbol):
+    candidates=[]
+    phs,pls=find_pivot_levels(df)
+    if side=="LONG": candidates+=[x for x in phs if x>entry]
+    else: candidates+=[x for x in pls if x<entry]
+    ph,pl=prev_day_hl(df)
+    if side=="LONG" and ph and ph>entry: candidates.append(ph)
+    if side=="SHORT" and pl and pl<entry: candidates.append(pl)
+    ema200,dc_hi,dc_lo=htf_levels(symbol)
+    if side=="LONG":
+        for lv in [ema200,dc_hi]:
+            if lv and lv>entry:candidates.append(lv)
     else:
-        if state[symbol]["trend"] != trend_now:
-            reset_state_for(symbol, trend_now)
-
-def compute_levels(side: str, entry: float, atr_v: float):
-    # ATR 기반 SL/TP 계산 + 가격/퍼센트 차이
-    risk = ATR_SL_MULT * atr_v  # 가격 단위
-    if side == "LONG":
-        sl = entry - risk
-        tp = entry + RR * risk
-        sl_diff = entry - sl       # 양수
-        tp_diff = tp - entry       # 양수
+        for lv in [ema200,dc_lo]:
+            if lv and lv<entry:candidates.append(lv)
+    peaks,poc=approx_hvn_poc(df)
+    if side=="LONG":
+        candidates+=[x for x in peaks if x>entry]
+        if poc and poc>entry:candidates.append(poc)
     else:
-        sl = entry + risk
-        tp = entry - RR * risk
-        sl_diff = sl - entry
-        tp_diff = entry - tp
-    sl_pct = (sl_diff / entry) * 100.0 if entry else 0.0
-    tp_pct = (tp_diff / entry) * 100.0 if entry else 0.0
-    return round(sl, 2), round(tp, 2), round(sl_diff, 2), round(tp_diff, 2), sl_pct, tp_pct
+        candidates+=[x for x in peaks if x<entry]
+        if poc and poc<entry:candidates.append(poc)
+    if not candidates:return None,[]
+    if side=="LONG":
+        barrier=min(candidates); refs=sorted(candidates)[:3]
+    else:
+        barrier=max(candidates); refs=sorted(candidates,reverse=True)[:3]
+    return float(barrier),[float(x) for x in refs]
 
-def build_message(sym: str, side: str, entry: float, sl: float, tp: float,
-                  sl_diff: float, tp_diff: float, sl_pct: float, tp_pct: float,
-                  last: pd.Series, rc_info: dict):
-    dt = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    atr_v = float(last.get("atr", float("nan")))
-    ema_f = float(last.get("ema_fast", float("nan")))
-    ema_t = float(last.get("ema_trend", float("nan")))
-    price = float(last.get("close", float("nan")))
-    # EMA근접 정도(ATR배수)
-    tol_ratio = abs(price - ema_f) / atr_v if (atr_v and not math.isnan(atr_v)) else float("nan")
+# ===================== SL/TP 계산 =====================
+def compute_levels(side, entry, atr_v):
+    risk=ATR_SL_MULT*atr_v
+    if side=="LONG":
+        sl, tp = entry-risk, entry+RR*risk
+        sl_diff, tp_diff = entry-sl, tp-entry
+    else:
+        sl, tp = entry+risk, entry-RR*risk
+        sl_diff, tp_diff = sl-entry, entry-tp
+    sl_pct=(sl_diff/entry)*100 if entry else 0
+    tp_pct=(tp_diff/entry)*100 if entry else 0
+    return round(sl,2),round(tp,2),round(sl_diff,2),round(tp_diff,2),sl_pct,tp_pct
 
-    lines = [
-        f"🔔 <b>{sym}</b> {TIMEFRAME} <b>{side}</b> (확인형 EMA{EMA_FAST} 리테스트 확정)",
-        f"Entry: <b>{fmt_price(entry)}</b> USDT",
-        f"SL: {fmt_price(sl)} USDT  (-{fmt_price(sl_diff)}, -{fmt_pct(sl_pct)})",
-        f"TP: {fmt_price(tp)} USDT  (+{fmt_price(tp_diff)}, +{fmt_pct(tp_pct)})",
-        "",
-        f"조건: EMA{EMA_TREND} {'상단' if side=='LONG' else '하단'}, EMA{EMA_FAST} 근접(≈ {tol_ratio:.2f}×ATR) 후 다음봉 {'고가' if side=='LONG' else '저가'} 돌파 마감",
-        f"현재가: {fmt_price(price)}, EMA{EMA_FAST}: {fmt_price(ema_f)}, EMA{EMA_TREND}: {fmt_price(ema_t)}, ATR{ATR_LEN}: {fmt_price(atr_v)}",
-        f"리테스트 봉 (UTC): H={fmt_price(rc_info['high'])}, L={fmt_price(rc_info['low'])}, C={fmt_price(rc_info['close'])}",
-        f"<i>{dt}</i>",
+# ===================== 시그널 로직 =====================
+_last_alert_ts={}
+
+def maybe_alert(sym, side, entry, last, rc_info, sig_type):
+    key=(sym,side,sig_type)
+    now=time.time()
+    if key not in _last_alert_ts: _last_alert_ts[key]=0
+    if now-_last_alert_ts[key]<COOLDOWN_MIN*60: return
+    atr_v=float(last["atr"])
+    sl,tp,sl_diff,tp_diff,sl_pct,tp_pct=compute_levels(side,entry,atr_v)
+    barrier,refs=pick_barrier(side,entry,last.to_frame().T,sym)
+    rr_note=""
+    if barrier:
+        dist=abs(barrier-entry)
+        risk=abs(entry-sl)
+        rr=dist/risk if risk>0 else 0
+        rr_note=f"장벽: {fmt_price(barrier)} (RR≈{rr:.2f})"
+        if rr<1.5: rr_note+=" ❌부족"
+        else: rr_note+=" ✅통과"
+    dt=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    lines=[
+        f"🔔 <b>{sym}</b> {TIMEFRAME} <b>{side}</b> ({sig_type})",
+        f"Entry: <b>{fmt_price(entry)}</b>",
+        f"SL: {fmt_price(sl)} (-{fmt_price(sl_diff)}, -{fmt_pct(sl_pct)})",
+        f"TP: {fmt_price(tp)} (+{fmt_price(tp_diff)}, +{fmt_pct(tp_pct)})",
     ]
-    return "\n".join(lines)
+    if rr_note: lines.append(rr_note)
+    lines.append(f"<i>{dt}</i>")
+    send_telegram("\n".join(lines))
+    _last_alert_ts[key]=now
 
-def maybe_alert(sym: str, side: str, entry: float, last: pd.Series, rc_info: dict):
-    # 쿨다운 체크
-    key = (sym, side)
-    now = time.time()
-    if key not in _last_alert_ts:
-        _last_alert_ts[key] = 0.0
-    if now - _last_alert_ts[key] < COOLDOWN_MIN * 60:
-        return
+# 리테스트 상태
+state={}
 
-    atr_v = float(last.get("atr", 0.0))
-    sl, tp, sl_diff, tp_diff, sl_pct, tp_pct = compute_levels(side, entry, atr_v)
-    msg = build_message(sym, side, entry, sl, tp, sl_diff, tp_diff, sl_pct, tp_pct, last, rc_info)
-    send_telegram(msg)
-    _last_alert_ts[key] = now
+def reset_state_for(symbol,trend):
+    state[symbol]={"trend":trend,"window_left":RETEST_WINDOW,"waiting_confirm":False,"retest_candle":None}
 
-def process_symbol(sym: str):
-    df = fetch_ohlcv_throttled(sym, TIMEFRAME, LIMIT)
-    if df.empty:
-        return
-    df = add_indicators(df).dropna()
-    if len(df) < max(EMA_TREND, ATR_LEN) + 5:
-        return
+def ensure_state(symbol,trend):
+    if symbol not in state or state[symbol]["trend"]!=trend:
+        reset_state_for(symbol,trend)
 
-    last = df.iloc[-1]
+def process_retest(sym,df):
+    last=df.iloc[-1]
+    trend="up" if last["close"]>last["ema_trend"] else "down"
+    ensure_state(sym,trend)
+    st=state[sym]
+    if not st["waiting_confirm"] and st["window_left"]>0:
+        atr_v=float(last["atr"])
+        if abs(last["close"]-last["ema_fast"])<=RETEST_TOL_ATR*atr_v:
+            st["retest_candle"]={"high":last["high"],"low":last["low"],"close":last["close"]}
+            st["waiting_confirm"]=True
+        st["window_left"]-=1
+    if st["waiting_confirm"] and st["retest_candle"]:
+        rc=st["retest_candle"]
+        if trend=="up" and last["close"]>=rc["high"]:
+            maybe_alert(sym,"LONG",last["close"],last,rc,"리테스트")
+            reset_state_for(sym,"up")
+        elif trend=="down" and last["close"]<=rc["low"]:
+            maybe_alert(sym,"SHORT",last["close"],last,rc,"리테스트")
+            reset_state_for(sym,"down")
 
-    # 1) 추세판단
-    trend_now = "up" if last["close"] > last["ema_trend"] else "down"
-    ensure_state(sym, trend_now)
+def process_golden(sym,df):
+    prev,cur=df.iloc[-2],df.iloc[-1]
+    if prev["ema_short"]<prev["ema_long"] and cur["ema_short"]>=cur["ema_long"]:
+        maybe_alert(sym,"LONG",cur["close"],cur,{},"골든크로스")
+    elif prev["ema_short"]>prev["ema_long"] and cur["ema_short"]<=cur["ema_long"]:
+        maybe_alert(sym,"SHORT",cur["close"],cur,{},"데드크로스")
 
-    st = state[sym]
-
-    # 2) 리테스트 감지 (대기 중 & 윈도우 남아있을 때 & 아직 확인대기 아님)
-    if not st["waiting_confirm"] and st["window_left"] > 0:
-        atr_v = float(last["atr"]) if not math.isnan(last["atr"]) else 0.0
-        near = False
-        if atr_v > 0:
-            near = abs(float(last["close"]) - float(last["ema_fast"])) <= (RETEST_TOL_ATR * atr_v)
-
-        if near:
-            st["retest_candle"] = {
-                "ts": int(last["ts"]),
-                "high": float(last["high"]),
-                "low": float(last["low"]),
-                "close": float(last["close"]),
-            }
-            st["waiting_confirm"] = True
-
-        # 윈도우 감소
-        st["window_left"] -= 1
-
-    # 3) 확인(다음 봉에서 돌파 마감) & 알림
-    if st["waiting_confirm"] and st["retest_candle"] is not None:
-        rc = st["retest_candle"]
-
-        # 추세 무효화 체크: 확인 전에 추세 깨지면 리셋
-        if trend_now == "up" and last["close"] < last["ema_trend"]:
-            reset_state_for(sym, "down")
-            return
-        if trend_now == "down" and last["close"] > last["ema_trend"]:
-            reset_state_for(sym, "up")
-            return
-
-        # 확인 조건
-        if trend_now == "up":
-            confirmed = float(last["close"]) >= rc["high"]
-            if confirmed:
-                entry = float(last["close"])  # 확인봉 종가
-                maybe_alert(sym, "LONG", entry, last, rc)
-                reset_state_for(sym, "up")
-                return
-        else:
-            confirmed = float(last["close"]) <= rc["low"]
-            if confirmed:
-                entry = float(last["close"])
-                maybe_alert(sym, "SHORT", entry, last, rc)
-                reset_state_for(sym, "down")
-                return
+def process_symbol(sym):
+    df=fetch_ohlcv_throttled(sym,TIMEFRAME,limit=300)
+    df=add_indicators(df).dropna()
+    if len(df)<max(EMA_TREND,ATR_LEN)+5: return
+    process_retest(sym,df)
+    process_golden(sym,df)
 
 # ===================== 메인 루프 =====================
 def main_loop():
-    print(f"[bot] start: EXCHANGE={EXCHANGE_NAME}, SYMBOLS={SYMBOLS}, TF={TIMEFRAME}")
-    # 초기 상태 세팅
     for sym in SYMBOLS:
         try:
-            df0 = fetch_ohlcv_throttled(sym, TIMEFRAME, limit=max(EMA_TREND, ATR_LEN) + 5)
-            df0 = add_indicators(df0).dropna()
-            if len(df0) == 0:
-                trend0 = "up"
-            else:
-                trend0 = "up" if df0.iloc[-1]["close"] > df0.iloc[-1]["ema_trend"] else "down"
-            reset_state_for(sym, trend0)
-        except Exception as e:
-            print(f"[init:{sym}] error:", str(e)[:200])
-            reset_state_for(sym, "up")
-
+            df0=fetch_ohlcv_throttled(sym,TIMEFRAME,limit=300)
+            df0=add_indicators(df0).dropna()
+            trend="up" if len(df0)>0 and df0.iloc[-1]["close"]>df0.iloc[-1]["ema_trend"] else "down"
+            reset_state_for(sym,trend)
+        except: reset_state_for(sym,"up")
     while True:
-        try:
-            for sym in SYMBOLS:
-                try:
-                    process_symbol(sym)
-                    time.sleep(0.4)
-                except ccxt.BaseError as e:
-                    print(f"[ccxt:{sym}] error:", str(e)[:200])
-                except Exception as e:
-                    print(f"[loop:{sym}] error:", str(e)[:200])
-        except Exception as e:
-            print("[loop] outer error:", str(e)[:200])
+        for sym in SYMBOLS:
+            try: process_symbol(sym); time.sleep(0.4)
+            except Exception as e: print(f"[loop:{sym}] {e}")
         time.sleep(POLL_SEC)
 
 # ===================== Flask =====================
-app = Flask(__name__)
+app=Flask(__name__)
 
 @app.get("/")
 def health():
-    body = {
-        "status": "ok",
-        "exchange": EXCHANGE_NAME,
-        "symbols": SYMBOLS,
-        "timeframe": TIMEFRAME,
-        "utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "params": {
-            "EMA_FAST": EMA_FAST,
-            "EMA_TREND": EMA_TREND,
-            "ATR_LEN": ATR_LEN,
-            "RETEST_TOL_ATR": RETEST_TOL_ATR,
-            "RETEST_WINDOW": RETEST_WINDOW,
-            "ATR_SL_MULT": ATR_SL_MULT,
-            "RR": RR,
-            "COOLDOWN_MIN": COOLDOWN_MIN,
-            "FETCH_MIN_SEC": FETCH_MIN_SEC,
-            "BACKOFF_START": BACKOFF_START,
-            "BACKOFF_MAX": BACKOFF_MAX,
-            "JITTER_MAX": JITTER_MAX,
-            "POLL_SEC": POLL_SEC,
-        }
-    }
-    return (json.dumps(body), 200, {"Content-Type": "application/json"})
+    return {"status":"ok","exchange":EXCHANGE,"symbols":SYMBOLS,"timeframe":TIMEFRAME}
 
 @app.get("/test")
 def test():
     send_telegram("✅ [투자봇] 텔레그램 연결 테스트")
-    return "sent", 200
+    return "sent",200
 
-# gunicorn import 시 1회만 백그라운드 워커 시작
-_worker_started = False
+_worker_started=False
 def _start_worker_once():
     global _worker_started
     if not _worker_started:
-        _worker_started = True
-        Thread(target=main_loop, daemon=True).start()
-
+        _worker_started=True
+        Thread(target=main_loop,daemon=True).start()
 _start_worker_once()
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    print("Starting dev Flask ...")
-    app.run(host="0.0.0.0", port=port)
+if __name__=="__main__":
+    port=int(os.getenv("PORT","10000"))
+    app.run(host="0.0.0.0",port=port)
