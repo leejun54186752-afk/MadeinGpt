@@ -509,3 +509,55 @@ def run_loop():
 # =========================
 if __name__ == "__main__":
     run_loop()
+    # === FastAPI web app wrapper (for Render web service) ===
+try:
+    from fastapi import FastAPI
+except Exception:
+    FastAPI = None
+
+_app_started = False
+
+def _start_background_loop_once():
+    """Start run_loop() in a daemon thread exactly once."""
+    global _app_started
+    if _app_started:
+        return
+    import threading
+    th = threading.Thread(target=run_loop, name="signal-loop", daemon=True)
+    th.start()
+    _app_started = True
+
+if FastAPI is not None:
+    app = FastAPI()
+
+    @app.on_event("startup")
+    def _on_startup():
+        # 백그라운드로 시그널 루프 시작
+        _start_background_loop_once()
+
+    @app.get("/health")
+    def health():
+        return {"ok": True}
+
+    @app.get("/status")
+    def status():
+        try:
+            st = load_state()
+            return {
+                "symbols": CFG["SYMBOLS"],
+                "positions": st,
+                "timeframe": CFG["TIMEFRAME"]
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+else:
+    # FastAPI가 없으면 app 심볼만 더미로 노출 (gunicorn이 찾을 수 있게)
+    class _Dummy:
+        def __call__(self, environ, start_response):
+            start_response("200 OK", [("Content-Type","text/plain")])
+            return [b"running"]
+    app = _Dummy()
+
+# CLI로 직접 실행할 때는 기존처럼 루프 실행
+if __name__ == "__main__":
+    run_loop()
