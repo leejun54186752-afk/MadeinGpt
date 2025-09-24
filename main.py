@@ -1,566 +1,511 @@
 # main.py
-import os, time, math, json, random, requests
-from datetime import datetime, timezone
-from threading import Thread
+# Live Signal Notifier — BTC / SOL / XRP (15m)
+# - ENTRY: BB breakout + ENG(+PIN) + MACD slope + RSI + Volume + Trend(EMA50>200)
+# - EXIT S3: TP1 +1.0R → 70% take → SL to BE → remainder trails by BB mid
+# - Alerts (모바일 포함 동일 포맷): 풀버전 텍스트 + 2줄 사유 / 진행이벤트
+# - State persists to ./state_positions.json (포지션/SL/TP1 여부)
+
+import os, json, time, math, statistics, traceback
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, Tuple
+from datetime import datetime, timezone, timedelta
 
 import numpy as np
 import pandas as pd
 import ccxt
-from flask import Flask
+import requests
 
-# ===================== (선택) 로컬 .env 로드 =====================
-if not os.getenv("RENDER"):
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(override=False)
-    except Exception:
-        pass
+# =========================
+# Config
+# =========================
+CFG = {
+    "EXCHANGE": os.getenv("EXCHANGE", "okx"),
+    "SYMBOLS": ["BTC/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT"],
+    "TIMEFRAME": "15m",
+    "HTF_TIMEFRAME": "1h",
+    "FETCH_LIMIT": 1200,       # 최근 약 12~13일 (15m)
+    "SQUEEZE_LOOKBACK": 600,   # pctl 계산 구간
+    "EMA_FAST": 50, "EMA_SLOW": 200,
+    "BB_PERIOD": 20, "BB_STD": 2.0,
+    "ATR_PERIOD": 14,
+    "MACD_FAST": 12, "MACD_SLOW": 26, "MACD_SIGNAL": 9,
+    "RSI_PERIOD": 14,
+    "INTRABAR_ORDER": "conservative",  # TP/SL 동시 충족 시 SL 우선
+    "SL_METHOD": "ATR",
+    # S3 partial
+    "TP1_R": 1.0, "TP1_WEIGHT": 0.7,   # 70% 익절
+    # Notifications
+    "STAR_SYMBOLS": {"XRP/USDT:USDT", "SOL/USDT:USDT"},  # 헤더에 ⭐
+    "SEND_INTERVAL_SEC": 20,    # 폴링 (권장 20~30초)
+    "STATE_FILE": "./state_positions.json",
+    # Notifiers (텔레그램/디스코드 둘다 비어있으면 콘솔로만 출력)
+    "TELEGRAM_BOT_TOKEN": os.getenv("TG_BOT_TOKEN", ""),
+    "TELEGRAM_CHAT_ID": os.getenv("TG_CHAT_ID", ""),
+    "DISCORD_WEBHOOK": os.getenv("DISCORD_WEBHOOK", ""),
+}
 
-# ===================== 환경 변수 =====================
-EXCHANGE = os.getenv("EXCHANGE", "bybit").strip().lower()
-SYMBOLS  = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+# 심볼별 오버라이드 (백테스트 좋은 설정 복원)
+CFG_SYMBOL = {
+    # BTC: 중립(거래수 살짝↑)
+    "BTC/USDT:USDT": {
+        "SQUEEZE_PCTL": 35, "ATR_MULT": 1.5,
+        "CONFIRM_MODE": "ENG+PIN", "COOLDOWN_BARS": 15,
+        "USE_HTF": True, "USE_VOL_FILTER": True, "VOL_BOOST": 1.2,
+        "USE_RSI_FILTER": True
+    },
+    # SOL: 보수(휩소 강함)
+    "SOL/USDT:USDT": {
+        "SQUEEZE_PCTL": 20, "ATR_MULT": 2.0,
+        "CONFIRM_MODE": "ENG", "COOLDOWN_BARS": 40,
+        "USE_HTF": True, "USE_VOL_FILTER": True, "VOL_BOOST": 1.5,
+        "USE_RSI_FILTER": True
+    },
+    # XRP: 에이스(신호수↑)
+    "XRP/USDT:USDT": {
+        "SQUEEZE_PCTL": 35, "ATR_MULT": 1.5,
+        "CONFIRM_MODE": "ENG+PIN", "COOLDOWN_BARS": 15,
+        "USE_HTF": True, "USE_VOL_FILTER": True, "VOL_BOOST": 1.1,
+        "USE_RSI_FILTER": True
+    },
+}
 
-# 주기/레이트리밋 보호
-POLL_SEC      = int(os.getenv("POLL_SEC", "15"))   # 메인 루프 슬립(초)
-FETCH_MIN_SEC = int(os.getenv("FETCH_MIN_SEC", "55")) # 같은 심볼 재호출 최소 간격(초)
-BACKOFF_START = int(os.getenv("BACKOFF_START", "60"))
-BACKOFF_MAX   = int(os.getenv("BACKOFF_MAX", "600"))
-JITTER_MAX    = int(os.getenv("JITTER_MAX", "3"))
+# =========================
+# Notifier
+# =========================
+class Notifier:
+    def __init__(self, tg_token: str, tg_chat: str, discord_hook: str):
+        self.tg_token = tg_token
+        self.tg_chat = tg_chat
+        self.discord_hook = discord_hook
 
-# 지표 파라미터
-EMA_FAST   = int(os.getenv("EMA_FAST", "20"))   # 리테스트 대상 EMA
-EMA_TREND  = int(os.getenv("EMA_TREND", "200")) # 추세 필터 EMA
-ATR_LEN    = int(os.getenv("ATR_LEN", "14"))
+    def send(self, text: str):
+        sent = False
+        if self.tg_token and self.tg_chat:
+            try:
+                url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
+                payload = {"chat_id": self.tg_chat, "text": text}
+                requests.post(url, json=payload, timeout=10)
+                sent = True
+            except Exception:
+                print("[telegram error]", traceback.format_exc())
+        if self.discord_hook:
+            try:
+                requests.post(self.discord_hook, json={"content": text}, timeout=10)
+                sent = True
+            except Exception:
+                print("[discord error]", traceback.format_exc())
+        if not sent:
+            print(text)
 
-# 리테스트 규칙(A안: 확인형)
-RETEST_TOL_ATR = float(os.getenv("RETEST_TOL_ATR", "0.3"))  # |Close-EMA20| <= 0.3*ATR
-RETEST_WINDOW  = int(os.getenv("RETEST_WINDOW", "30"))      # 200EMA 돌파 후 ~N캔들 내 리테스트 유효
+notifier = Notifier(CFG["TELEGRAM_BOT_TOKEN"], CFG["TELEGRAM_CHAT_ID"], CFG["DISCORD_WEBHOOK"])
 
-# SL/TP 기본 계수(최종은 연속형 RR 추천으로 대체될 수 있음)
-ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.5"))  # SL = entry ± 1.5*ATR
+# =========================
+# Helpers & Indicators
+# =========================
+def tz_kst(ts_utc: pd.Timestamp) -> str:
+    if ts_utc.tzinfo is None: ts_utc = ts_utc.tz_localize(timezone.utc)
+    return (ts_utc.astimezone(timezone(timedelta(hours=9)))).strftime("%Y-%m-%d %H:%M")
 
-# 쿨다운(동일 심볼/방향)
-COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "60"))  # 분
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
 
-# 상위 TF 장벽 계산용
-HTF_FOR_BARRIERS = os.getenv("HTF_FOR_BARRIERS", "1h")
-HTF_EMAS = [20, 200]
+def macd(s: pd.Series, f=12, sl=26, sig=9):
+    line = ema(s, f) - ema(s, sl)
+    signal = ema(line, sig)
+    return line, signal, line - signal
 
-# 텔레그램
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+def bollinger(close: pd.Series, n=20, k=2.0):
+    mid = close.rolling(n).mean()
+    std = close.rolling(n).std(ddof=0)
+    return mid + k*std, mid, mid - k*std
 
-# ===================== Flask 먼저 생성 (데코레이터 오류 방지) =====================
-app = Flask(__name__)
+def rsi(series: pd.Series, n=14):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.rolling(n).mean()
+    roll_down = down.rolling(n).mean()
+    rs = roll_up / roll_down
+    return 100 - (100 / (1 + rs))
 
-# ===================== 유틸/알림 =====================
-def send_telegram(msg: str):
-    if not TG_TOKEN or not TG_CHAT:
-        print("[WARN] Telegram not configured.")
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        payload = {"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
-        r = requests.post(url, json=payload, timeout=15)
-        if r.status_code >= 400:
-            print("[TG-ERR]", r.status_code, r.text[:300])
-    except Exception as e:
-        print("[TG-EXC]", e)
+def true_range(df: pd.DataFrame) -> pd.Series:
+    cp = df["close"].shift(1)
+    a = df["high"] - df["low"]
+    b = (df["high"] - cp).abs()
+    c = (df["low"] - cp).abs()
+    return pd.concat([a,b,c], axis=1).max(axis=1)
 
-def fmt_price(x: float) -> str:
-    return f"{x:,.2f}"
+def atr(df: pd.DataFrame, n: int) -> pd.Series:
+    return true_range(df).rolling(n).mean()
 
-def fmt_pct(pct: float) -> str:
-    return f"{pct:.2f}%"
+def percent_rank(arr: np.ndarray, v: float) -> float:
+    if len(arr) == 0 or np.isnan(v): return np.nan
+    return float((arr <= v).sum()) / len(arr) * 100.0
 
-# ===================== 거래소 =====================
-def build_exchange():
-    name = EXCHANGE
-    if name == "bybit":
-        return ccxt.bybit({"enableRateLimit": True})
-    elif name in ("binanceusdm", "binance_futures", "binance_perp"):
-        return ccxt.binanceusdm({"enableRateLimit": True})
-    else:
-        return ccxt.binance({"enableRateLimit": True})
+def detect_bull_engulf(po, pc, co, cc):
+    return (pc < po) and (cc > co) and (cc >= po) and (co <= pc)
 
-ex = build_exchange()
+def detect_bear_engulf(po, pc, co, cc):
+    return (pc > po) and (cc < co) and (cc <= po) and (co >= pc)
 
-# ===================== 안전 fetch 래퍼/캐시 =====================
-_last_fetch = {}     # key: (symbol, timeframe) -> epoch
-_df_cache   = {}     # key: (symbol, timeframe) -> df
-_backoff    = 0
+def detect_pinbar(o,h,l,c, bullish=True, body_maxr=0.35, tail_minr=0.6):
+    rng = h - l
+    if rng <= 0: return False
+    body = abs(c - o)
+    if body > rng * body_maxr: return False
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    return (lower >= rng*tail_minr) if bullish else (upper >= rng*tail_minr)
 
-def fetch_ohlcv_throttled(symbol, timeframe, limit=400):
-    """레이트리밋 안전 호출 + 캐시 반환"""
-    global _backoff
-    key = (symbol, timeframe)
-    now = time.time()
-    last_t = _last_fetch.get(key, 0)
+def breakout_ok(row, side):
+    return row.close > row.bb_upper if side=="long" else row.close < row.bb_lower
 
-    if now - last_t < FETCH_MIN_SEC and key in _df_cache:
-        return _df_cache[key]
+def squeeze_ok(row, th):
+    return (not math.isnan(row.bb_pctl)) and (row.bb_pctl <= th)
 
-    if JITTER_MAX > 0:
-        time.sleep(random.uniform(0, JITTER_MAX))
+def macd_ok(prev, curr, side):
+    return (curr.macd_hist > 0 and curr.macd_hist > prev.macd_hist) if side=="long" else \
+           (curr.macd_hist < 0 and curr.macd_hist < prev.macd_hist)
 
-    if _backoff > 0:
-        time.sleep(_backoff)
+def rsi_ok(curr, side, use=True):
+    if not use: return True
+    return curr.rsi > 50 if side=="long" else curr.rsi < 50
 
-    try:
-        ohlcv = ex.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC")
-        _df_cache[key] = df
-        _last_fetch[key] = time.time()
-        _backoff = max(0, int(_backoff/2))
-        return df
-    except ccxt.BaseError as e:
-        msg = str(e)
-        if ("429" in msg) or ("418" in msg) or ("Too much request" in msg) or ("Way too much" in msg):
-            _backoff = BACKOFF_START if _backoff == 0 else min(BACKOFF_MAX, _backoff*2)
-            print(f"[rate-limit] backoff={_backoff}s {symbol} {timeframe} :: {msg[:120]}")
-        else:
-            print(f"[ccxt:{symbol}] {msg[:200]}")
-        return _df_cache.get(key, pd.DataFrame(columns=["ts","open","high","low","close","volume","dt"]))
+def vol_ok(curr, use, boost, med):
+    if not use: return True
+    if math.isnan(med) or med <= 0: return True
+    return curr.volume >= med * boost
 
-# ===================== 지표 =====================
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
+def trend_flags(row):
+    return row.ema_fast > row.ema_slow, row.ema_fast < row.ema_slow
 
-def atr(df: pd.DataFrame, length: int) -> pd.Series:
-    if df.empty:
-        return pd.Series(dtype="float64")
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([(high-low), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(length).mean()
+def get_sl(entry, row_prev, df, i_prev, is_long, method, atr_mult):
+    if method.upper() == "ATR":
+        a = float(row_prev.atr)
+        if np.isnan(a) or a <= 0:
+            # fallback: swing
+            seg = df.iloc[max(0, i_prev-20):i_prev+1]
+            return float(seg.low.min()) if is_long else float(seg.high.max())
+        return entry - atr_mult*a if is_long else entry + atr_mult*a
+    # fallback
+    return float(row_prev.bb_mid)
 
-def macd(df: pd.DataFrame, fast=12, slow=26, sig=9):
-    ema_fast = ema(df["close"], fast)
-    ema_slow = ema(df["close"], slow)
-    macd_line = ema_fast - ema_slow
-    signal = ema(macd_line, sig)
-    hist = macd_line - signal
-    return macd_line, signal, hist
+# =========================
+# Exchange
+# =========================
+def load_ex(name: str):
+    name = name.lower()
+    if name == "okx":     return ccxt.okx({"enableRateLimit": True})
+    if name == "bybit":   return ccxt.bybit({"enableRateLimit": True})
+    if name == "binance": return ccxt.binance({"enableRateLimit": True, "options":{"defaultType":"future"}})
+    raise ValueError("Unsupported EXCHANGE")
 
-def add_indicators(df: pd.DataFrame):
-    if df.empty: return df
-    df["ema_fast"]  = ema(df["close"], EMA_FAST)
-    df["ema_trend"] = ema(df["close"], EMA_TREND)
-    df["atr"]       = atr(df, ATR_LEN)
-    macd_line, macd_sig, macd_hist = macd(df)
-    df["macd"] = macd_line
-    df["macd_sig"] = macd_sig
-    df["macd_hist"] = macd_hist
-    # 거래량 대비 등급용
-    df["vol_ma50"] = df["volume"].rolling(50).mean()
-    df["vol_ma200"] = df["volume"].rolling(200).mean()
+def fetch_ohlcv(ex, sym, tf, limit) -> Optional[pd.DataFrame]:
+    raw = ex.fetch_ohlcv(sym, timeframe=tf, limit=limit)
+    if not raw: return None
+    df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
 
-# ===================== 장벽(저항/지지) 탐지 =====================
-def pivot_levels(df: pd.DataFrame, lookback=20):
-    """간단 pivot high/low 추출"""
-    if len(df) < lookback+2:
-        return [], []
-    highs = []
-    lows = []
-    h = df["high"].values
-    l = df["low"].values
-    for i in range(lookback, len(df)-lookback):
-        if h[i] == max(h[i-lookback:i+lookback+1]):
-            highs.append(h[i])
-        if l[i] == min(l[i-lookback:i+lookback+1]):
-            lows.append(l[i])
-    return highs[-10:], lows[-10:]  # 최근 것 위주
+# =========================
+# Features
+# =========================
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    up, mid, lo = bollinger(df["close"], CFG["BB_PERIOD"], CFG["BB_STD"])
+    bb_w = (up - lo) / mid
+    efast = ema(df["close"], CFG["EMA_FAST"])
+    eslow = ema(df["close"], CFG["EMA_SLOW"])
+    m_line, m_sig, m_hist = macd(df["close"], CFG["MACD_FAST"], CFG["MACD_SLOW"], CFG["MACD_SIGNAL"])
+    A = atr(df, CFG["ATR_PERIOD"])
+    RSI = rsi(df["close"], CFG["RSI_PERIOD"])
 
-def round_levels_near(price: float, step: float = None, count: int = 6):
-    """반올림 숫자대: 스텝 자동 추정(가격 크기에 비례)"""
-    if step is None:
-        # 대략적 스텝 추정
-        if price >= 50000: step = 1000
-        elif price >= 10000: step = 500
-        elif price >= 1000: step = 100
-        elif price >= 100: step = 10
-        elif price >= 10: step = 1
-        else: step = 0.1
-    base = round(price/step)*step
-    return [base + k*step for k in range(-count//2, count//2+1)]
+    out = df.copy()
+    out["bb_upper"], out["bb_mid"], out["bb_lower"] = up, mid, lo
+    out["bb_w"] = bb_w
+    out["ema_fast"], out["ema_slow"] = efast, eslow
+    out["macd_line"], out["macd_sig"], out["macd_hist"] = m_line, m_sig, m_hist
+    out["atr"] = A
+    out["rsi"] = RSI
 
-def adr_levels(df: pd.DataFrame, multiples=(1.0, 1.5, 2.0)):
-    """최근 N봉 평균 TR(=ATR 대용) 기반 레벨"""
-    if df.empty: return []
-    tr = atr(df, ATR_LEN)
-    if tr.empty or np.isnan(tr.iloc[-1]): return []
-    last = df.iloc[-1]
-    last_close = float(last["close"])
-    trv = float(tr.iloc[-1])
-    lvls = []
-    for m in multiples:
-        lvls += [last_close + m*trv, last_close - m*trv]
-    return lvls
+    # rolling percentile (no lookahead)
+    out["bb_pctl"] = np.nan
+    Np = CFG["SQUEEZE_LOOKBACK"]
+    if len(out) > Np + 5:
+        arr = out["bb_w"].values
+        for i in range(Np, len(out)):
+            hist = arr[i-Np:i]
+            v = arr[i]
+            out.iat[i, out.columns.get_loc("bb_pctl")] = percent_rank(hist, v)
 
-def hvn_levels(df: pd.DataFrame, bins=24):
-    """간이 HVN: 최근 구간을 가격빈으로 나눠 빈도 최상위 bin 중심"""
-    if len(df) < 200: return []
-    closes = df["close"].tail(600).values  # 최근 ~600틱
-    lo, hi = closes.min(), closes.max()
-    if hi <= lo: return []
-    hist, edges = np.histogram(closes, bins=bins, range=(lo, hi))
-    idxs = np.argsort(hist)[-3:]  # 상위 3 bin
-    centers = []
-    for i in idxs:
-        centers.append((edges[i] + edges[i+1])/2)
-    return sorted(centers)
+    # volume median
+    out["vol_med20"] = out["volume"].rolling(20).median()
+    return out
 
-def htf_ema_levels(symbol: str, emalens=HTF_EMAS):
-    """상위 TF EMA 레벨 수집 (레이트리밋 보호!)"""
-    df = fetch_ohlcv_throttled(symbol, HTF_FOR_BARRIERS, limit=max(emalens)+50)
-    if df.empty: return []
-    df = add_indicators(df)
-    lvls = []
-    for ln in emalens:
-        s = ema(df["close"], ln)
-        if not s.empty and not np.isnan(s.iloc[-1]):
-            lvls.append(float(s.iloc[-1]))
-    return lvls
+def fetch_htf_alignment(ex, sym: str) -> Tuple[bool, bool]:
+    try:
+        hdf = fetch_ohlcv(ex, sym, CFG["HTF_TIMEFRAME"], 400)
+        if hdf is None or len(hdf) < CFG["EMA_SLOW"] + 5:
+            return True, True
+        f = ema(hdf["close"], CFG["EMA_FAST"])
+        s = ema(hdf["close"], CFG["EMA_SLOW"])
+        return bool(f.iloc[-2] > s.iloc[-2]), bool(f.iloc[-2] < s.iloc[-2])
+    except Exception:
+        return True, True
 
-def nearest_barriers(df15: pd.DataFrame, symbol: str, price: float):
-    """상·하 방향 각각 가장 가까운 장벽들과 거리"""
-    highs, lows = pivot_levels(df15, lookback=20)
-    rounds = round_levels_near(price)
-    adrs   = adr_levels(df15)
-    hvns   = hvn_levels(df15)
-    htf    = htf_ema_levels(symbol)
+# =========================
+# Position State
+# =========================
+@dataclass
+class Position:
+    symbol: str
+    side: str            # LONG / SHORT
+    entry: float
+    sl: float
+    tp1_price: float
+    took_tp1: bool
+    size_remain: float   # 1.0 at entry, 0.3 after TP1
+    ts_entry: str
+    reason: str
 
-    all_lvls = {
-        "pivot_high": highs,
-        "pivot_low": lows,
-        "round": rounds,
-        "adr": adrs,
-        "h_ema": htf
-    }
-    # 위/아래 분리
-    up, down = [], []
-    for key, arr in all_lvls.items():
-        for lv in arr:
-            if lv >= price: up.append(("UP", key, float(lv), float(lv - price)))
-            if lv <= price: down.append(("DN", key, float(lv), float(price - lv)))
-    up  = sorted(up, key=lambda x: x[3])[:5]
-    down= sorted(down, key=lambda x: x[3])[:5]
-    return up, down
+def load_state() -> Dict[str, dict]:
+    fp = CFG["STATE_FILE"]
+    if not os.path.exists(fp): return {}
+    try:
+        with open(fp, "r") as f: return json.load(f)
+    except Exception:
+        return {}
 
-# ===================== 신호 로직 =====================
-# 심볼 상태(리테스트용)
-state = {}  # symbol -> {trend, window_left, waiting_confirm, retest_candle}
-_last_alert_ts = {}  # (symbol, side, tag) -> epoch
+def save_state(st: Dict[str, dict]):
+    try:
+        with open(CFG["STATE_FILE"], "w") as f:
+            json.dump(st, f, indent=2)
+    except Exception:
+        print("[state save error]")
 
-def ensure_state(symbol: str, trend_now: str):
-    st = state.get(symbol)
-    if (st is None) or (st["trend"] != trend_now):
-        state[symbol] = {
-            "trend": trend_now,
-            "window_left": RETEST_WINDOW,
-            "waiting_confirm": False,
-            "retest_candle": None
-        }
+# =========================
+# Alert formatting
+# =========================
+def fmt_percent(x: float, digits=1) -> str:
+    return f"{x:.{digits}f}%"
 
-def rr_recommendation(side: str, atr_v: float, up_barriers, down_barriers,
-                      htf_align_score: float, volume_tier: str, macd_momentum: float):
-    """
-    연속형 RR 추천 (1.3~2.5 범위) : 스코어 기반
-    - 장벽 거리 넉넉/순풍/모멘텀 강 → RR↑
-    - 장벽 가깝/역풍/모멘텀 약 → RR↓
-    """
-    if atr_v <= 0 or math.isnan(atr_v):
-        atr_v = 1.0
-    # 장벽 거리 점수(익절 방향이 더 멀수록 가점)
-    if side == "LONG":
-        up_dist  = up_barriers[0][3] if up_barriers else atr_v
-        dn_dist  = down_barriers[0][3] if down_barriers else atr_v
-    else:
-        up_dist  = down_barriers[0][3] if down_barriers else atr_v
-        dn_dist  = up_barriers[0][3] if up_barriers else atr_v
-    # ATR 대비 거리 비율
-    tp_room = up_dist/atr_v
-    sl_wall = dn_dist/atr_v
+def fmt_price(x: float) -> str:
+    # 간단 포맷 (거래소 틱 규칙은 주문시 반올림 적용 권장)
+    if x >= 1000: return f"{x:,.0f}"
+    if x >= 100:  return f"{x:,.2f}"
+    if x >= 1:    return f"{x:,.4f}"
+    return f"{x:.6f}"
 
-    score = 0.0
-    # 익절 공간
-    score += np.clip(tp_room, 0, 3) * 0.7
-    # 손절까지 완충
-    score += np.clip(sl_wall, 0, 3) * 0.3
-    # 상위TF 정렬
-    score += htf_align_score * 0.6
-    # 거래량 등급
-    vol_map = {"A": 0.6, "B": 0.3, "C": 0.0}
-    score += vol_map.get(volume_tier, 0.0)
-    # MACD 모멘텀
-    score += np.clip(macd_momentum, -2, 2) * 0.2
+def entry_alert(symbol, side, tf, entry, sl, tp1_price, sl_pct, pctl, vol_boost, htf_trend, confirm_tag, risk_pct=0.75):
+    star = "⭐" if symbol in CFG["STAR_SYMBOLS"] else ""
+    head = f"[ENTRY{star}] {tf} | {symbol} | {side.capitalize()}"
+    body1 = f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} (ATR×{CFG_SYMBOL[symbol]['ATR_MULT']}, ΔSL {fmt_percent(sl_pct)}) | TP1 +1.0R @ {fmt_price(tp1_price)} (≈+{fmt_percent(sl_pct)})"
+    filt = f"Risk {risk_pct:.2f}% | HTF{'↑' if htf_trend=='up' else '↓' if htf_trend=='down' else '-'} | BB squeeze p{int(pctl)} | Vol>{vol_boost}×med"
+    text = f"{head}\n{body1}\n{filt}"
+    return text
 
-    # 점수→RR 매핑 (대략 1.3 ~ 2.5 범위)
-    rr = 1.3 + (np.clip(score, 0, 5) / 5.0) * (2.5 - 1.3)
-    return float(round(rr, 2))
+def reason_alert(bu, reason_notes):
+    return f"Reason: {bu}\nNotes: {reason_notes}"
 
-def compute_levels(side: str, entry: float, atr_v: float, rr: float):
-    risk = ATR_SL_MULT * atr_v
-    if side == "LONG":
-        sl = entry - risk
-        tp = entry + rr * risk
-        sl_diff = entry - sl
-        tp_diff = tp - entry
-    else:
-        sl = entry + risk
-        tp = entry - rr * risk
-        sl_diff = sl - entry
-        tp_diff = entry - tp
-    sl_pct = (sl_diff/entry)*100.0 if entry else 0.0
-    tp_pct = (tp_diff/entry)*100.0 if entry else 0.0
-    # 소수 둘째자리 표기
-    return round(sl,2), round(tp,2), round(sl_diff,2), round(tp_diff,2), round(sl_pct,2), round(tp_pct,2)
+def tp1_alert(symbol, side, tf, entry, new_sl, realized_r):
+    head = f"[TP1] {tf} | {symbol} {side.capitalize()} | +{realized_r:.1f}R realized"
+    body = f"SL → BE({fmt_price(entry)})로 이동, 잔여 30% BB mid 트레일"
+    return f"{head}\n{body}"
 
-def volume_tier_of(df_last: pd.Series):
-    """A/B/C 등급"""
-    v  = float(df_last["volume"])
-    v50 = float(df_last.get("vol_ma50", np.nan))
-    v200= float(df_last.get("vol_ma200", np.nan))
-    ratio = 0.0
-    if v50 and not math.isnan(v50) and v50>0:
-        ratio = v / v50
-    # 느슨 등급
-    if ratio >= 1.5: return "A"
-    if ratio >= 1.1: return "B"
-    return "C"
+def exit_alert(symbol, side, reason, price, total_r=None, entry=None):
+    if reason == "BE_stop":
+        return f"[EXIT] {symbol} {side.capitalize()} | BE_stop at {fmt_price(entry)} | Total +0.7R"
+    if reason == "MidCross":
+        return f"[EXIT] {symbol} {side.capitalize()} | MidCross | Total {total_r:+.1f}R"
+    if reason == "SL":
+        return f"[EXIT] {symbol} {side.capitalize()} | SL {fmt_price(price)} | -1.0R"
+    # fallback
+    return f"[EXIT] {symbol} {side.capitalize()} | {reason}"
 
-def htf_align(df15_last: pd.Series):
-    """상위TF 정렬 간단 점수: 15m close vs 200EMA, macd_hist 기초"""
-    score = 0.0
-    # 15m 기준 추세(200EMA)
-    if float(df15_last["close"]) > float(df15_last["ema_trend"]): score += 0.5
-    else: score -= 0.2
-    # 15m macd_hist
-    mh = float(df15_last.get("macd_hist", 0.0))
-    score += np.clip(mh, -1, 1) * 0.5
-    return float(np.clip(score, -1, 1))
-
-def golden_cross_signal(df: pd.DataFrame):
-    """EMA10/EMA20 + MACD 히스토그램 기준 골든/데드 크로스 탐지"""
-    if len(df) < 30: return None
-    ema10 = ema(df["close"], 10)
-    ema20 = ema(df["close"], 20)
-    macd_line, sig, hist = macd(df)
-    cross_up = (ema10.iloc[-2] <= ema20.iloc[-2]) and (ema10.iloc[-1] > ema20.iloc[-1])
-    cross_dn = (ema10.iloc[-2] >= ema20.iloc[-2]) and (ema10.iloc[-1] < ema20.iloc[-1])
-    # 모멘텀 동행
-    if cross_up and hist.iloc[-1] > 0:
-        return "GOLDEN"
-    if cross_dn and hist.iloc[-1] < 0:
-        return "DEAD"
-    return None
-
-def maybe_alert(sym: str, side: str, tag: str, entry1: float, entry2: float,
-                rr: float, last: pd.Series, rc_info: dict,
-                up_barriers, down_barriers):
-    # 쿨다운
-    key = (sym, side, tag)
-    now = time.time()
-    if now - _last_alert_ts.get(key, 0.0) < COOLDOWN_MIN*60:
-        return
-    atr_v = float(last.get("atr", 0.0))
-    sl1,tp1,sl1d,tp1d,sl1p,tp1p = compute_levels(side, entry1, atr_v, rr)
-    sl2,tp2,sl2d,tp2d,sl2p,tp2p = compute_levels(side, entry2, atr_v, rr)
-
-    # 장벽 요약(최단 거리 1~2개)
-    def barrier_lines(arr, prefix):
-        lines=[]
-        for i, itm in enumerate(arr[:2], start=1):
-            _dir, typ, lvl, dist = itm
-            lines.append(f"{prefix}{i}. {typ.upper()} @ {fmt_price(lvl)} (Δ {fmt_price(dist)})")
-        return lines
-
-    vtier = volume_tier_of(last)
-    mh = float(last.get("macd_hist", 0.0))
-
-    lines = [
-        f"🔔 <b>{sym}</b> {TIMEFRAME} <b>{side}</b> [{tag}]",
-        f"추천 RR: <b>{rr:.2f}</b>",
-        "",
-        f"① <u>확정 진입</u> (확인봉 종가): {fmt_price(entry1)}",
-        f"   SL {fmt_price(sl1)} (-{fmt_price(sl1d)}, -{fmt_pct(sl1p)}) / TP {fmt_price(tp1)} (+{fmt_price(tp1d)}, +{fmt_pct(tp1p)})",
-        "",
-        f"② <u>되돌림 진입</u> (EMA{EMA_FAST} 근처): {fmt_price(entry2)}",
-        f"   SL {fmt_price(sl2)} (-{fmt_price(sl2d)}, -{fmt_pct(sl2p)}) / TP {fmt_price(tp2)} (+{fmt_price(tp2d)}, +{fmt_pct(tp2p)})",
-        "",
-        f"장벽↑(익절방향):"] + barrier_lines(up_barriers, "• ") + [
-        f"장벽↓(손절방향):"] + barrier_lines(down_barriers, "• ") + [
-        "",
-        f"컨텍스트: Vol tier={vtier}, MACD_hist={mh:.3f}, ATR{ATR_LEN}={fmt_price(float(last.get('atr',0.0)))}",
-        f"<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</i>"
-    ]
-    send_telegram("\n".join(lines))
-    _last_alert_ts[key] = now
-
-def process_symbol(sym: str):
-    df = fetch_ohlcv_throttled(sym, TIMEFRAME, limit=400)
-    if df.empty: return
-    df = add_indicators(df).dropna()
-    if len(df) < max(EMA_TREND, ATR_LEN) + 10: return
-    last = df.iloc[-1]
-
-    # 추세확인 (리테스트 흐름)
-    trend_now = "up" if last["close"] > last["ema_trend"] else "down"
-    ensure_state(sym, trend_now)
-    st = state[sym]
-
-    # 골든/데드 크로스 체크 (보조 시그널)
-    gc = golden_cross_signal(df)  # "GOLDEN" or "DEAD" or None
-
-    # 리테스트: EMA_FAST 근접 → 다음봉 확인
-    atr_v = float(last["atr"]) if not np.isnan(last["atr"]) else 0.0
-    near = False
-    if atr_v > 0:
-        near = abs(float(last["close"]) - float(last["ema_fast"])) <= (RETEST_TOL_ATR * atr_v)
-
-    # 200EMA 상단(up)일 때만 롱 리테스트 후보, 하단(down)일 때만 숏
-    if not st["waiting_confirm"] and st["window_left"] > 0 and near:
-        st["retest_candle"] = {
-            "ts": int(last["ts"]),
-            "high": float(last["high"]),
-            "low": float(last["low"]),
-            "close": float(last["close"]),
-            "ema_fast": float(last["ema_fast"])
-        }
-        st["waiting_confirm"] = True
-
-    # 윈도우 진행
-    if st["window_left"] > 0:
-        st["window_left"] -= 1
-
-    # 확인 단계(이번 봉에서 리테스트 봉의 고/저 돌파 마감)
-    if st["waiting_confirm"] and st["retest_candle"] is not None:
-        rc = st["retest_candle"]
-        # 추세 무효화 시 리셋
-        if trend_now == "up" and last["close"] < last["ema_trend"]:
-            ensure_state(sym, "down")
-            return
-        if trend_now == "down" and last["close"] > last["ema_trend"]:
-            ensure_state(sym, "up")
-            return
-
-        confirmed = False
-        side = None
-        if trend_now == "up":
-            confirmed = float(last["close"]) >= rc["high"]
-            side = "LONG"
-        else:
-            confirmed = float(last["close"]) <= rc["low"]
-            side = "SHORT"
-
-        if confirmed:
-            # 진입가 2가지
-            entry_confirm = float(last["close"])
-            entry_pullbk  = float(last.get("ema_fast", rc["ema_fast"]))  # 되돌림 목표
-
-            # 장벽 계산(15m 기준 + HTF EMA)
-            up_b, dn_b = nearest_barriers(df, sym, float(last["close"]))
-
-            # 컨텍스트 점수/등급
-            vtier = volume_tier_of(last)
-            hscore = htf_align(last)
-            mh = float(last.get("macd_hist", 0.0))
-            # 연속형 RR 추천
-            rr = rr_recommendation(side, atr_v, up_b, dn_b, hscore, vtier, mh)
-
-            tag = "리테스트"
-            # 보조: 골든/데드가 같이 방금 발생했다면 태그에 표기
-            if (side=="LONG" and gc=="GOLDEN") or (side=="SHORT" and gc=="DEAD"):
-                tag += "+크로스동행"
-
-            maybe_alert(sym, side, tag, entry_confirm, entry_pullbk, rr, last, rc, up_b, dn_b)
-            # 상태 리셋(동일 추세 지속)
-            ensure_state(sym, trend_now)
-            return
-
-    # 별도: 골든/데드 크로스 자체 시그널 (거래량 등급 느슨 적용 + ATR 환경 보조)
-    if gc in ("GOLDEN", "DEAD"):
-        side = "LONG" if gc=="GOLDEN" else "SHORT"
-        # 추세 반대면 신뢰 낮음 → 그대로 알리되 RR 낮게 갈 것
-        entry_confirm = float(last["close"])
-        entry_pullbk  = float(last["ema_fast"])
-        up_b, dn_b = nearest_barriers(df, sym, entry_confirm)
-        vtier = volume_tier_of(last)
-        hscore = htf_align(last)
-        mh = float(last.get("macd_hist", 0.0))
-        rr = rr_recommendation(side, float(last.get("atr",0.0)), up_b, dn_b, hscore, vtier, mh)
-        maybe_alert(sym, side, "골든크로스" if side=="LONG" else "데드크로스",
-                    entry_confirm, entry_pullbk, rr, last, {"high": last["high"],"low": last["low"],"close": last["close"]},
-                    up_b, dn_b)
-
-# ===================== 메인 루프 =====================
-def main_loop():
-    print(f"[bot] start: EXCHANGE={EXCHANGE}, SYMBOLS={SYMBOLS}, TF={TIMEFRAME}")
-    # 초기 상태 세팅
-    for sym in SYMBOLS:
-        try:
-            df0 = fetch_ohlcv_throttled(sym, TIMEFRAME, limit=max(EMA_TREND, ATR_LEN)+20)
-            df0 = add_indicators(df0).dropna()
-            if len(df0)==0:
-                trend0 = "up"
-            else:
-                trend0 = "up" if df0.iloc[-1]["close"] > df0.iloc[-1]["ema_trend"] else "down"
-            ensure_state(sym, trend0)
-        except Exception as e:
-            print(f"[init:{sym}] {str(e)[:200]}")
-            ensure_state(sym, "up")
+# =========================
+# Core signal loop
+# =========================
+def run_loop():
+    ex = load_ex(CFG["EXCHANGE"])
+    state = load_state()
 
     while True:
         try:
-            for sym in SYMBOLS:
-                try:
-                    process_symbol(sym)
-                    time.sleep(0.4)  # 심볼 간 소폭 쉬기
-                except Exception as e:
-                    print(f"[loop:{sym}] {str(e)[:200]}")
+            for sym in CFG["SYMBOLS"]:
+                params = CFG_SYMBOL[sym]
+                df = fetch_ohlcv(ex, sym, CFG["TIMEFRAME"], CFG["FETCH_LIMIT"])
+                if df is None or len(df) < 300: 
+                    print(f"[skip] {sym} not enough data")
+                    continue
+                df = build_features(df)
+
+                # HTF trend
+                htf_up, htf_down = (True, True)
+                if params.get("USE_HTF", True):
+                    htf_up, htf_down = fetch_htf_alignment(ex, sym)
+                htf_trend = "up" if htf_up else ("down" if htf_down else "-")
+
+                # 마지막 2개 바 기준: 신호바=직전, 엔트리바=현재
+                i = len(df) - 1
+                prev = df.iloc[i-1]
+                prev2 = df.iloc[i-2]
+                curr = df.iloc[i]    # 엔트리 가격으로 현재 봉 open 사용
+
+                # 트렌드(15m)
+                t_long, t_short = trend_flags(prev)
+
+                # 확인(ENG 또는 ENG+PIN)
+                bull_eng = detect_bull_engulf(prev2.open, prev2.close, prev.open, prev.close)
+                bear_eng = detect_bear_engulf(prev2.open, prev2.close, prev.open, prev.close)
+                confirm_mode = params["CONFIRM_MODE"]
+                if confirm_mode == "ENG":
+                    conf_long = bull_eng
+                    conf_short = bear_eng
+                    confirm_tag = "ENG"
+                else:
+                    bull_pin = detect_pinbar(prev.open, prev.high, prev.low, prev.close, True)
+                    bear_pin = detect_pinbar(prev.open, prev.high, prev.low, prev.close, False)
+                    conf_long = bull_eng or bull_pin
+                    conf_short = bear_eng or bear_pin
+                    confirm_tag = "ENG+PIN" if (bull_pin or bear_pin) else "ENG"
+
+                # 필터
+                base_long = squeeze_ok(prev, params["SQUEEZE_PCTL"]) and breakout_ok(prev, "long") \
+                            and conf_long and macd_ok(prev2, prev, "long") \
+                            and rsi_ok(prev, "long", params.get("USE_RSI_FILTER", True)) \
+                            and vol_ok(prev, params.get("USE_VOL_FILTER", True), params["VOL_BOOST"], prev.vol_med20)
+                base_short = squeeze_ok(prev, params["SQUEEZE_PCTL"]) and breakout_ok(prev, "short") \
+                            and conf_short and macd_ok(prev2, prev, "short") \
+                            and rsi_ok(prev, "short", params.get("USE_RSI_FILTER", True)) \
+                            and vol_ok(prev, params.get("USE_VOL_FILTER", True), params["VOL_BOOST"], prev.vol_med20)
+
+                long_sig = base_long and t_long
+                short_sig = base_short and t_short
+
+                if params.get("USE_HTF", True):
+                    long_sig = long_sig and htf_up
+                    short_sig = short_sig and htf_down
+
+                # 쿨다운: 동일 심볼 최근 엔트리로부터 bars 제한
+                key = f"{sym}"
+                srec = state.get(key, {})
+                last_idx = srec.get("last_entry_idx", -1)
+                cooldown = params["COOLDOWN_BARS"]
+                can_long = long_sig and ((i - 1) - last_idx >= cooldown)
+                can_short = short_sig and ((i - 1) - last_idx >= cooldown)
+
+                # 포지션 유무
+                pos: Optional[Position] = None
+                if srec.get("position"):
+                    pos = Position(**srec["position"])
+
+                # ========== ENTRY ==========
+                if (can_long or can_short) and pos is None:
+                    side = "LONG" if can_long else "SHORT"
+                    entry = float(curr.open)
+                    sl = get_sl(entry, prev, df, i-1, is_long=(side=="LONG"),
+                                method=CFG["SL_METHOD"], atr_mult=params["ATR_MULT"])
+                    risk = (entry - sl) if side=="LONG" else (sl - entry)
+                    if risk > 0 and np.isfinite(risk):
+                        sl_pct = abs(risk/entry) * 100.0
+                        tp1_price = entry + risk if side=="LONG" else entry - risk
+                        # Alerts
+                        bu = ("BBU 돌파" if side=="LONG" else "BBL 돌파") + (" + Bull Engulfing" if (side=="LONG" and bull_eng) else " + Bear Engulfing" if (side=="SHORT" and bear_eng) else "")
+                        if confirm_mode == "ENG+PIN":
+                            if side=="LONG" and detect_pinbar(prev.open, prev.high, prev.low, prev.close, True): bu += " + Pinbar"
+                            if side=="SHORT" and detect_pinbar(prev.open, prev.high, prev.low, prev.close, False): bu += " + Pinbar"
+                        bu += (" + MACD(hist↑)" if side=="LONG" else " + MACD(hist↓)")
+                        bu += (" + RSI>50" if side=="LONG" else " + RSI<50")
+                        reason_notes = f"쿨다운 {cooldown}바, HTF {htf_trend}, confirm {confirm_tag}"
+
+                        ent_txt = entry_alert(sym, side.lower(), CFG["TIMEFRAME"],
+                                              entry, sl, tp1_price, sl_pct,
+                                              params["SQUEEZE_PCTL"], params["VOL_BOOST"],
+                                              htf_trend, confirm_tag, risk_pct=0.75)
+                        notifier.send(ent_txt)
+                        notifier.send(reason_alert(bu, reason_notes))
+
+                        # Save position
+                        state[key] = {
+                            "last_entry_idx": i-1,
+                            "position": asdict(Position(
+                                symbol=sym, side=side, entry=entry, sl=sl,
+                                tp1_price=tp1_price, took_tp1=False, size_remain=1.0,
+                                ts_entry=tz_kst(curr.name) if hasattr(curr, "name") else tz_kst(df.iloc[i]["ts"]),
+                                reason=bu
+                            ))
+                        }
+                        save_state(state)
+                        continue
+
+                # ========== POSITION MANAGEMENT ==========
+                if pos is not None:
+                    # 현재/최근 바들로 TP1/BE/MidCross/SL 체크
+                    # 엔트리 이후 모든 바 스캔 대신, 최신 바 기준으로 순차 처리
+                    # 최신 바
+                    bar = df.iloc[i]
+                    side = pos.side
+                    entry = pos.entry
+                    curr_sl = pos.sl
+                    tp1 = pos.tp1_price
+                    # 먼저 TP1/SL 동시: intrabar 우선순위 = SL(보수)
+                    tp_hit = (bar.high >= tp1) if side=="LONG" else (bar.low <= tp1)
+                    sl_hit = (bar.low <= curr_sl) if side=="LONG" else (bar.high >= curr_sl)
+
+                    # 아직 TP1 안했으면
+                    if not pos.took_tp1:
+                        if tp_hit and not sl_hit:
+                            # TP1 체결
+                            pos.took_tp1 = True
+                            pos.size_remain = 0.3
+                            pos.sl = entry  # SL → BE
+                            notifier.send(tp1_alert(pos.symbol, pos.side.lower(), CFG["TIMEFRAME"], entry, pos.sl, CFG["TP1_WEIGHT"]*CFG["TP1_R"]))
+                            # 저장
+                            state[key]["position"] = asdict(pos)
+                            save_state(state)
+                            continue
+                        elif sl_hit and not tp_hit:
+                            # 손절
+                            notifier.send(exit_alert(pos.symbol, pos.side.lower(), "SL", price=curr_sl, entry=entry))
+                            state[key]["position"] = None
+                            save_state(state)
+                            continue
+                        # 동시 히트는 정책상 SL 우선(보수)
+                        elif tp_hit and sl_hit:
+                            notifier.send(exit_alert(pos.symbol, pos.side.lower(), "SL", price=curr_sl, entry=entry))
+                            state[key]["position"] = None
+                            save_state(state)
+                            continue
+                    else:
+                        # TP1 이후: BE stop 또는 BB mid cross
+                        be_hit = (bar.low <= pos.sl) if side=="LONG" else (bar.high >= pos.sl)
+                        if be_hit:
+                            notifier.send(exit_alert(pos.symbol, pos.side.lower(), "BE_stop", price=pos.sl, entry=entry))
+                            state[key]["position"] = None
+                            save_state(state)
+                            continue
+                        # BB mid cross (종가 기준)
+                        mid = float(bar.bb_mid)
+                        if (side=="LONG" and bar.close < mid) or (side=="SHORT" and bar.close > mid):
+                            # 총 R 계산: 0.7R + (0.3 * rem_r)
+                            risk = (entry - (entry - (pos.tp1_price - entry))) if side=="LONG" else ((entry + (entry - pos.tp1_price)) - entry)
+                            # 위 risk 계산은 의미 없이 복잡하므로 재계산:
+                            risk = abs(pos.tp1_price - entry)  # = 1.0R 폭
+                            rem_r = ((bar.close - entry) / risk) if side=="LONG" else ((entry - bar.close) / risk)
+                            total_r = CFG["TP1_WEIGHT"]*CFG["TP1_R"] + (1.0 - CFG["TP1_WEIGHT"]) * rem_r
+                            notifier.send(exit_alert(pos.symbol, pos.side.lower(), "MidCross", price=bar.close, total_r=total_r, entry=entry))
+                            state[key]["position"] = None
+                            save_state(state)
+                            continue
+
+            time.sleep(CFG["SEND_INTERVAL_SEC"])
         except Exception as e:
-            print("[loop:outer]", str(e)[:200])
-        time.sleep(POLL_SEC)
+            print("[loop error]", e)
+            print(traceback.format_exc())
+            time.sleep(CFG["SEND_INTERVAL_SEC"])
+            continue
 
-# ===================== Flask 라우트 =====================
-@app.get("/")
-def health():
-    body = {
-        "status": "ok",
-        "exchange": EXCHANGE,
-        "symbols": SYMBOLS,
-        "timeframe": TIMEFRAME,
-        "utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "params": {
-            "EMA_FAST": EMA_FAST, "EMA_TREND": EMA_TREND, "ATR_LEN": ATR_LEN,
-            "RETEST_TOL_ATR": RETEST_TOL_ATR, "RETEST_WINDOW": RETEST_WINDOW,
-            "ATR_SL_MULT": ATR_SL_MULT, "COOLDOWN_MIN": COOLDOWN_MIN,
-            "FETCH_MIN_SEC": FETCH_MIN_SEC, "BACKOFF_START": BACKOFF_START,
-            "BACKOFF_MAX": BACKOFF_MAX, "JITTER_MAX": JITTER_MAX, "POLL_SEC": POLL_SEC,
-            "HTF": HTF_FOR_BARRIERS, "HTF_EMAS": HTF_EMAS
-        }
-    }
-    return (json.dumps(body), 200, {"Content-Type": "application/json"})
-
-@app.get("/test")
-def test():
-    send_telegram("✅ [투자봇] 텔레그램 연결 테스트")
-    return "sent", 200
-
-# ===================== gunicorn 임포트 시 1회 워커 기동 =====================
-_worker_started = False
-def _start_worker_once():
-    global _worker_started
-    if not _worker_started:
-        _worker_started = True
-        Thread(target=main_loop, daemon=True).start()
-
-_start_worker_once()
-
+# =========================
+# Entrypoint
+# =========================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    print("Starting dev Flask ...")
-    app.run(host="0.0.0.0", port=port)
+    run_loop()
