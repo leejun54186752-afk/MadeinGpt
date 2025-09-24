@@ -2,5 +2,8 @@ ccxt
 pandas
 numpy
 requests
-flask
+
+# Render / FastAPI 서비스용 추가
+fastapi
+uvicorn
 gunicorn
